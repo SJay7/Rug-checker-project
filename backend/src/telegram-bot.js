@@ -1,15 +1,18 @@
 
 // ================================================================
-// RUG CHECKER TELEGRAM BOT - Interactive Version
+// RUG CHECKER TELEGRAM BOT - Multi-Chain Version
 // ================================================================
 
 const TelegramBot = require('node-telegram-bot-api');
-const { silentScan, formatSmallNumber } = require('./rug-checker');
+const { silentScan, formatSmallNumber, getChain, getSupportedChains, DEFAULT_CHAIN } = require('./rug-checker');
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || 'YOUR_BOT_TOKEN_HERE';
 
 // Store scan results for callback buttons
 const scanCache = new Map();
+
+// Store user's preferred chain per chat
+const userChains = new Map();
 
 // ================================================================
 // HELPERS
@@ -47,22 +50,64 @@ function formatAge(days) {
     return `${Math.floor(days / 365)}y ${Math.floor((days % 365) / 30)}mo`;
 }
 
+function getChainEmoji(chainKey) {
+    const emojis = {
+        eth: '🔷',
+        bsc: '🟡',
+        base: '🔵',
+        polygon: '🟣',
+        arbitrum: '🔷',
+        avalanche: '🔺',
+        optimism: '🔴',
+        fantom: '👻',
+        cronos: '🔷',
+        linea: '⬛',
+        monad: '🟪',
+        abstract: '⬜'
+    };
+    return emojis[chainKey] || '🔷';
+}
+
+function getUserChain(chatId) {
+    return userChains.get(chatId) || DEFAULT_CHAIN;
+}
+
+function setUserChain(chatId, chainKey) {
+    userChains.set(chatId, chainKey);
+}
+
+// Format large numbers: 1500 -> 1.5K, 1500000 -> 1.5M, 1500000000 -> 1.5B
+function formatNum(num) {
+    if (num === null || num === undefined || isNaN(num)) return '0';
+    const absNum = Math.abs(num);
+    if (absNum >= 1e12) return (num / 1e12).toFixed(1).replace(/\.0$/, '') + 'T';
+    if (absNum >= 1e9) return (num / 1e9).toFixed(1).replace(/\.0$/, '') + 'B';
+    if (absNum >= 1e6) return (num / 1e6).toFixed(1).replace(/\.0$/, '') + 'M';
+    if (absNum >= 1e3) return (num / 1e3).toFixed(1).replace(/\.0$/, '') + 'K';
+    return num.toFixed(0);
+}
+
 // ================================================================
 // FORMAT SUMMARY (Clean Compact View)
 // ================================================================
 
 function formatSummary(tokenAddress, scanData) {
-    const { results, riskScore, riskLevel } = scanData;
+    const { results, riskScore, riskLevel, chain, chainName } = scanData;
     const { tokenInfo, contractScan, liquidity, holders, honeypot, sentiment } = results;
+    
+    const chainConfig = getChain(chain);
+    const chainEmoji = getChainEmoji(chain);
     
     let msg = '';
     const emoji = getRiskEmoji(riskLevel);
     
-    // Token Name with risk
+    // Token Name with chain badge
     if (tokenInfo?.success) {
-        msg += `${emoji} *${esc(tokenInfo.name)}* \\(${esc(tokenInfo.symbol)}\\)\n\n`;
+        msg += `${emoji} *${esc(tokenInfo.name)}* \\(${esc(tokenInfo.symbol)}\\)\n`;
+        msg += `${chainEmoji} ${esc(chainName)}\n\n`;
     } else {
-        msg += `${emoji} *Token Scan*\n\n`;
+        msg += `${emoji} *Token Scan*\n`;
+        msg += `${chainEmoji} ${esc(chainName)}\n\n`;
     }
     
     // Contract status line
@@ -93,11 +138,10 @@ function formatSummary(tokenAddress, scanData) {
     // Market Data
     if (liquidity?.success) {
         msg += `💲 \\| Price: \\$${esc(formatSmallNumber(liquidity.priceInUSD))}\n`;
-        msg += `💎 \\| MC: \\$${esc(liquidity.marketCap.toLocaleString())}\n`;
+        msg += `💎 \\| MC: \\$${esc(formatNum(liquidity.marketCap))}\n`;
         
-        // Liquidity with percentage of MC
         const liqPercent = liquidity.marketCap > 0 ? ((liquidity.liquidityUSD / liquidity.marketCap) * 100).toFixed(1) : 0;
-        msg += `💧 \\| Liq: \\$${esc(liquidity.liquidityUSD.toLocaleString())} \\(${esc(liqPercent)}%\\)\n`;
+        msg += `💧 \\| Liq: \\$${esc(formatNum(liquidity.liquidityUSD))} \\(${esc(liqPercent)}%\\)\n`;
     }
     
     // Tax
@@ -105,33 +149,31 @@ function formatSummary(tokenAddress, scanData) {
         msg += `💳 \\| Tax: B: ${esc(honeypot.buyTax.toFixed(1))}% \\| S: ${esc(honeypot.sellTax.toFixed(1))}%\n`;
     }
     
-    // LP Lock
-    if (liquidity?.success) {
-        msg += `🔒 \\| LP Lock: ${esc(liquidity.safePercent.toFixed(1))}%`;
-        if (liquidity.burnedPercent > 50) {
+    // LP Lock (use honeypot data - more reliable)
+    if (honeypot?.success && honeypot.lpHolders?.length > 0) {
+        const lpBurned = honeypot.lpBurnedPercent || 0;
+        const lpLocked = honeypot.lpLockedPercent || 0;
+        const lpSafe = lpBurned + lpLocked;
+        msg += `🔒 \\| LP Lock: ${esc(lpSafe.toFixed(1))}%`;
+        if (lpBurned > 50) {
             msg += ` burned\n`;
-        } else if (liquidity.lockedPercent > 50) {
+        } else if (lpLocked > 50) {
             msg += ` locked\n`;
-        } else {
+        } else if (lpSafe < 50) {
             msg += ` ⚠️\n`;
+        } else {
+            msg += `\n`;
         }
     }
     
     // Supply
     if (tokenInfo?.success) {
         const supplyNum = Number(tokenInfo.circulatingSupply || tokenInfo.totalSupply);
-        let supplyStr;
-        if (supplyNum >= 1e12) supplyStr = (supplyNum / 1e12).toFixed(1) + 'T';
-        else if (supplyNum >= 1e9) supplyStr = (supplyNum / 1e9).toFixed(1) + 'B';
-        else if (supplyNum >= 1e6) supplyStr = (supplyNum / 1e6).toFixed(1) + 'M';
-        else if (supplyNum >= 1e3) supplyStr = (supplyNum / 1e3).toFixed(1) + 'K';
-        else supplyStr = supplyNum.toLocaleString();
-        msg += `🟢 \\| Supply: ${esc(supplyStr)}\n`;
+        msg += `🟢 \\| Supply: ${esc(formatNum(supplyNum))}\n`;
     }
     
     // Holders
     if (holders?.success) {
-        const holderCount = holders.topHolders?.length || 0;
         msg += `👩‍👧‍👦 \\| Top 10: ${esc(holders.top10Percent.toFixed(2))}%\n`;
     }
     
@@ -180,15 +222,14 @@ function formatSummary(tokenAddress, scanData) {
 // ================================================================
 
 function formatFullReport(tokenAddress, scanData) {
-    const { results, riskScore, riskLevel } = scanData || {};
+    const { results, riskScore, riskLevel, chain, chainName } = scanData || {};
     const { tokenInfo, contractScan, liquidity, holders, honeypot, sentiment } = results || {};
     
-    let msg = '';
+    const chainConfig = getChain(chain);
+    const chainEmoji = getChainEmoji(chain);
+    const nativeSymbol = chainConfig?.native?.symbol || 'ETH';
     
-    // Safe accessor helper
-    const safe = (fn, fallback = 'N/A') => {
-        try { return fn(); } catch { return fallback; }
-    };
+    let msg = '';
     
     // ═══════════════════════════════════════
     // HEADER
@@ -197,7 +238,7 @@ function formatFullReport(tokenAddress, scanData) {
     msg += `🔍 *RUG CHECKER \\- Full Report*\n`;
     msg += `════════════════════════════════\n`;
     msg += `Token: \`${tokenAddress}\`\n`;
-    msg += `Chain: Ethereum Mainnet\n`;
+    msg += `Chain: ${chainEmoji} ${esc(chainName)}\n`;
     msg += `Time: ${esc(new Date().toISOString())}\n`;
     msg += `════════════════════════════════\n\n`;
     
@@ -209,13 +250,14 @@ function formatFullReport(tokenAddress, scanData) {
     try {
         if (tokenInfo?.success) {
             msg += `Contract: \`${esc(shortAddr(tokenAddress))}\`\n`;
+            msg += `  └ \`${tokenAddress}\`\n`;
             msg += `Name: ${esc(tokenInfo.name || 'Unknown')}\n`;
             msg += `Symbol: ${esc(tokenInfo.symbol || '?')}\n`;
             msg += `Decimals: ${tokenInfo.decimals || 18}\n`;
-            msg += `Total Supply: ${esc(Number(tokenInfo.totalSupply || 0).toLocaleString())}\n`;
+            msg += `Total Supply: ${esc(formatNum(Number(tokenInfo.totalSupply || 0)))}\n`;
             if (tokenInfo.burnedPercent && tokenInfo.burnedPercent > 0) {
-                msg += `Burned: ${esc(Number(tokenInfo.burnedSupply || 0).toLocaleString())} \\(${esc((tokenInfo.burnedPercent || 0).toFixed(2))}%\\)\n`;
-                msg += `Circulating: ${esc(Number(tokenInfo.circulatingSupply || 0).toLocaleString())}\n`;
+                msg += `Burned: ${esc(formatNum(Number(tokenInfo.burnedSupply || 0)))} \\(${esc((tokenInfo.burnedPercent || 0).toFixed(2))}%\\)\n`;
+                msg += `Circulating: ${esc(formatNum(Number(tokenInfo.circulatingSupply || 0)))}\n`;
             }
             msg += `Owner: \`${esc(shortAddr(tokenInfo.owner))}\``;
             if (tokenInfo.ownerStatus === 'renounced') {
@@ -223,6 +265,9 @@ function formatFullReport(tokenAddress, scanData) {
                 msg += `Owner Status: RENOUNCED\n`;
             } else {
                 msg += `\n`;
+                if (tokenInfo.owner) {
+                    msg += `  └ \`${tokenInfo.owner}\`\n`;
+                }
                 msg += `Owner Status: ${esc((tokenInfo.ownerStatus || 'unknown').toUpperCase())}\n`;
             }
             if (tokenInfo.contractAge !== null && tokenInfo.contractAge !== undefined) {
@@ -294,22 +339,18 @@ function formatFullReport(tokenAddress, scanData) {
     try {
         if (liquidity?.success) {
             msg += `*PRICE & MARKET DATA:*\n`;
-            msg += `ETH Price: \\$${esc((liquidity.ethPrice || 0).toLocaleString())}\n`;
+            msg += `${esc(nativeSymbol)} Price: \\$${esc(formatNum(liquidity.nativePrice || 0))}\n`;
             msg += `Token Price: \\$${esc(formatSmallNumber(liquidity.priceInUSD || 0))}\n`;
-            msg += `Token Price: ${esc(formatSmallNumber(liquidity.priceInETH || 0))} ETH\n`;
-            msg += `Market Cap: \\$${esc((liquidity.marketCap || 0).toLocaleString())}\n`;
-            msg += `FDV: \\$${esc((liquidity.fdv || 0).toLocaleString())}\n`;
+            msg += `Token Price: ${esc(formatSmallNumber(liquidity.priceInNative || 0))} ${esc(nativeSymbol)}\n`;
+            msg += `Market Cap: \\$${esc(formatNum(liquidity.marketCap || 0))}\n`;
+            msg += `FDV: \\$${esc(formatNum(liquidity.fdv || 0))}\n`;
             msg += `\n*LIQUIDITY POOL:*\n`;
             if (liquidity.pairAddress) {
                 msg += `Pool Address: \`${esc(shortAddr(liquidity.pairAddress))}\`\n`;
+                msg += `  └ \`${liquidity.pairAddress}\`\n`;
             }
-            msg += `WETH in Pool: ${esc((liquidity.wethInPool || 0).toFixed(4))} ETH\n`;
-            msg += `Liquidity: \\$${esc((liquidity.liquidityUSD || 0).toLocaleString())}\n`;
-            msg += `\n*LP TOKEN SECURITY:*\n`;
-            msg += `LP Burned: ${esc((liquidity.burnedPercent || 0).toFixed(2))}%\n`;
-            msg += `LP Locked: ${esc((liquidity.lockedPercent || 0).toFixed(2))}%\n`;
-            msg += `LP Safe: ${esc((liquidity.safePercent || 0).toFixed(2))}%\n`;
-            msg += `LP At Risk: ${esc((100 - (liquidity.safePercent || 0)).toFixed(2))}%\n`;
+            msg += `${esc(nativeSymbol)} in Pool: ${esc((liquidity.nativeAmount || 0).toFixed(4))} ${esc(nativeSymbol)}\n`;
+            msg += `Liquidity: \\$${esc(formatNum(liquidity.liquidityUSD || 0))}\n`;
             msg += `\nRisk: ${esc(liquidity.risk || 'UNKNOWN')}\n`;
         } else {
             msg += `Error: ${esc(liquidity?.error || 'No liquidity pool found')}\n`;
@@ -339,8 +380,8 @@ function formatFullReport(tokenAddress, scanData) {
             if (holders.topHolders?.length > 0) {
                 msg += `\n*TOP 5 HOLDERS:*\n`;
                 holders.topHolders.slice(0, 5).forEach((h, i) => {
-                    msg += `  ${i + 1}\\. \`${esc(shortAddr(h.address))}\`\n`;
-                    msg += `     Holding: ${esc((h.percent || 0).toFixed(2))}%\n`;
+                    msg += `  ${i + 1}\\. \`${esc(shortAddr(h.address))}\` \\(${esc((h.percent || 0).toFixed(2))}%\\)\n`;
+                    msg += `     └ \`${h.address}\`\n`;
                 });
             }
             msg += `\nRisk: ${esc(holders.risk || 'UNKNOWN')}\n`;
@@ -368,27 +409,27 @@ function formatFullReport(tokenAddress, scanData) {
             msg += `Open Source: ${honeypot.isOpenSource ? '✅ Yes' : '❌ No'}\n`;
             msg += `Proxy: ${honeypot.isProxy ? '⚠️ Yes' : '✅ No'}\n`;
             msg += `Mintable: ${honeypot.isMintable ? '⚠️ Yes' : '✅ No'}\n`;
-            msg += `Hidden Owner: ${honeypot.hasHiddenOwner ? '⚠️ Yes' : '✅ No'}\n`;
-            msg += `Can Reclaim: ${honeypot.canReclaim ? '⚠️ Yes' : '✅ No'}\n`;
+            msg += `Hidden Owner: ${honeypot.hiddenOwner ? '⚠️ Yes' : '✅ No'}\n`;
+            msg += `Can Reclaim: ${honeypot.canTakeBackOwnership ? '⚠️ Yes' : '✅ No'}\n`;
             msg += `\n*TRADING FLAGS:*\n`;
             msg += `Cannot Buy: ${honeypot.cannotBuy ? '❌ Yes' : '✅ No'}\n`;
-            msg += `Cannot Sell: ${honeypot.cannotSell ? '❌ Yes' : '✅ No'}\n`;
-            msg += `Pausable: ${honeypot.isPausable ? '⚠️ Yes' : '✅ No'}\n`;
+            msg += `Cannot Sell: ${honeypot.cannotSellAll ? '❌ Yes' : '✅ No'}\n`;
+            msg += `Pausable: ${honeypot.transferPausable ? '⚠️ Yes' : '✅ No'}\n`;
             msg += `Blacklist: ${honeypot.isBlacklisted ? '⚠️ Yes' : '✅ No'}\n`;
             msg += `Anti\\-Whale: ${honeypot.isAntiWhale ? '⚠️ Yes' : '✅ No'}\n`;
             
             if (honeypot.lpHolders?.length > 0) {
+                const lpBurned = honeypot.lpBurnedPercent || 0;
+                const lpLocked = honeypot.lpLockedPercent || 0;
+                const lpSafe = lpBurned + lpLocked;
+                const lpAtRisk = 100 - lpSafe;
+                
                 msg += `\n*LP SECURITY:*\n`;
-                msg += `LP Holders: ${honeypot.lpHolders.length}\n`;
-                msg += `LP Burned: ${esc((honeypot.lpBurnedPercent || 0).toFixed(2))}%\n`;
-                msg += `LP Locked: ${esc((honeypot.lpLockedPercent || 0).toFixed(2))}%\n`;
-                msg += `LP Safe: ${esc((honeypot.lpSafePercent || 0).toFixed(2))}%\n`;
-                msg += `LP At Risk: ${esc((100 - (honeypot.lpSafePercent || 0)).toFixed(2))}%\n`;
-                msg += `\n*TOP LP HOLDERS:*\n`;
-                honeypot.lpHolders.slice(0, 3).forEach((lp, i) => {
-                    const status = lp.is_locked ? '[LOCKED]' : lp.is_burned ? '[BURNED]' : '[AT RISK]';
-                    msg += `  ${i + 1}\\. ${esc((lp.percent || 0).toFixed(2))}% ${esc(status)} ${esc(lp.tag || 'Wallet')}\n`;
-                });
+                msg += `LP Holders: ${honeypot.lpHolderCount || honeypot.lpHolders.length}\n`;
+                msg += `LP Burned: ${esc(lpBurned.toFixed(2))}%\n`;
+                msg += `LP Locked: ${esc(lpLocked.toFixed(2))}%\n`;
+                msg += `LP Safe: ${esc(lpSafe.toFixed(2))}%\n`;
+                msg += `LP At Risk: ${esc(lpAtRisk.toFixed(2))}%\n`;
             }
             msg += `\nRisk: ${esc(honeypot.risk || 'UNKNOWN')}\n`;
         } else {
@@ -419,7 +460,7 @@ function formatFullReport(tokenAddress, scanData) {
             }
             msg += `24 hours: ${fmt(sentiment.priceChange24h)}\n`;
             msg += `\n*TRADING ACTIVITY:*\n`;
-            msg += `Volume 24h: \\$${esc((sentiment.volume24h || 0).toLocaleString())}\n`;
+            msg += `Volume 24h: \\$${esc(formatNum(sentiment.volume24h || 0))}\n`;
             if (sentiment.volumeActivity) {
                 msg += `Activity: ${esc(sentiment.volumeActivity)}\n`;
             }
@@ -442,16 +483,6 @@ function formatFullReport(tokenAddress, scanData) {
                         msg += `  \\[${esc(type)}\\] ${esc(s.url)}\n`;
                     }
                 });
-            }
-            
-            // Quick Links
-            msg += `\n*QUICK LINKS:*\n`;
-            if (sentiment.pairAddress) {
-                msg += `  DexScreener: dexscreener\\.com/ethereum/${esc(sentiment.pairAddress)}\n`;
-            }
-            msg += `  Etherscan: etherscan\\.io/token/${esc(tokenAddress)}\n`;
-            if (sentiment.pairAddress) {
-                msg += `  DEXTools: dextools\\.io/app/ether/pair\\-explorer/${esc(sentiment.pairAddress)}\n`;
             }
         } else {
             msg += `Error: ${esc(sentiment?.error || 'Token not found on DexScreener')}\n`;
@@ -514,15 +545,19 @@ function formatFullReport(tokenAddress, scanData) {
         
         if (liquidity?.success) {
             if ((liquidity.liquidityUSD || 0) > 100000) {
-                msg += `\\[\\+\\] Good liquidity \\(\\$${esc((liquidity.liquidityUSD || 0).toLocaleString())}\\)\n`;
+                msg += `\\[\\+\\] Good liquidity \\(\\$${esc(formatNum(liquidity.liquidityUSD || 0))}\\)\n`;
             } else if ((liquidity.liquidityUSD || 0) < 10000) {
                 msg += `\\[\\-\\] Low liquidity\n`;
             }
-            
-            if ((liquidity.safePercent || 0) >= 80) {
-                msg += `\\[\\+\\] ${esc((liquidity.safePercent || 0).toFixed(1))}% of LP locked/burned\n`;
-            } else if ((liquidity.safePercent || 0) < 50) {
-                msg += `\\[\\!\\] Only ${esc((liquidity.safePercent || 0).toFixed(1))}% LP secured\n`;
+        }
+        
+        // Use honeypot LP data for key findings (more reliable)
+        if (honeypot?.success && honeypot.lpHolders?.length > 0) {
+            const lpSafe = (honeypot.lpBurnedPercent || 0) + (honeypot.lpLockedPercent || 0);
+            if (lpSafe >= 80) {
+                msg += `\\[\\+\\] ${esc(lpSafe.toFixed(1))}% of LP locked/burned\n`;
+            } else if (lpSafe < 50) {
+                msg += `\\[\\!\\] Only ${esc(lpSafe.toFixed(1))}% LP secured\n`;
             }
         }
         
@@ -544,9 +579,6 @@ function formatFullReport(tokenAddress, scanData) {
         
         if (sentiment?.success) {
             msg += `\\[i\\] Sentiment: ${esc(sentiment.sentimentLevel || 'UNKNOWN')} \\(${sentiment.sentimentScore || 0}/100\\)\n`;
-            if (sentiment.websites?.length > 0 || sentiment.socials?.length > 0) {
-                msg += `\\[\\+\\] Has website and social media\n`;
-            }
         }
     } catch (e) {
         // Skip findings on error
@@ -592,6 +624,7 @@ const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
 console.log('\n══════════════════════════════');
 console.log('RUG0xRADAR BOT STARTED');
+console.log('Multi-Chain Support Enabled');
 console.log('══════════════════════════════\n');
 
 // ================================================================
@@ -599,8 +632,13 @@ console.log('══════════════════════�
 // ================================================================
 
 bot.onText(/\/start/, (msg) => {
+    const userChain = getUserChain(msg.chat.id);
+    const chainConfig = getChain(userChain);
+    const chainEmoji = getChainEmoji(userChain);
+    
     const keyboard = {
         inline_keyboard: [
+            [{ text: '⛓️ Select Chain', callback_data: 'chains' }],
             [{ text: '📖 How to Use', callback_data: 'help' }]
         ]
     };
@@ -608,11 +646,18 @@ bot.onText(/\/start/, (msg) => {
     bot.sendMessage(msg.chat.id, `
 🔍 *Rug0xRadar*
 
-Your token security scanner\\.
+Your multi\\-chain token security scanner\\.
 
-Paste any Ethereum token address to scan\\!
+*Current Chain:* ${chainEmoji} ${esc(chainConfig?.name || 'Ethereum')}
 
-Features:
+Paste any token address to scan\\!
+
+*Supported Chains:*
+🔷 ETH • 🟡 BSC • 🔵 Base • 🟣 Polygon
+🔷 Arbitrum • 🔺 AVAX • 🔴 Optimism • 👻 FTM
+🟪 Monad • ⬜ Abstract • ⬛ Linea • 🔷 Cronos
+
+*Features:*
 • Honeypot detection
 • Tax analysis
 • LP security
@@ -625,9 +670,15 @@ bot.onText(/\/help/, (msg) => {
     bot.sendMessage(msg.chat.id, `
 *How to use:*
 
-1\\. Paste a token contract address
-2\\. Get instant summary
-3\\. Click "Full Report" for details
+1\\. Select your chain with /chain
+2\\. Paste a token contract address
+3\\. Get instant summary
+4\\. Click "Full Report" for details
+
+*Commands:*
+/start \\- Welcome message
+/chain \\- Select blockchain
+/help \\- This help
 
 *Risk Levels:*
 🟢 LOW \\- Looks safe
@@ -637,28 +688,75 @@ bot.onText(/\/help/, (msg) => {
     `, { parse_mode: 'MarkdownV2' });
 });
 
+bot.onText(/\/chain/, (msg) => {
+    showChainSelector(msg.chat.id);
+});
+
+function showChainSelector(chatId, messageId = null) {
+    const userChain = getUserChain(chatId);
+    const chains = getSupportedChains();
+    
+    // Build chain buttons (2 per row)
+    const rows = [];
+    for (let i = 0; i < chains.length; i += 2) {
+        const row = [];
+        for (let j = i; j < Math.min(i + 2, chains.length); j++) {
+            const chain = chains[j];
+            const emoji = getChainEmoji(chain.key);
+            const selected = chain.key === userChain ? ' ✓' : '';
+            row.push({ 
+                text: `${emoji} ${chain.shortName}${selected}`, 
+                callback_data: `chain_${chain.key}` 
+            });
+        }
+        rows.push(row);
+    }
+    
+    const keyboard = { inline_keyboard: rows };
+    const text = `⛓️ *Select Blockchain*\n\nCurrent: ${getChainEmoji(userChain)} ${esc(getChain(userChain)?.name || 'Unknown')}`;
+    
+    if (messageId) {
+        bot.editMessageText(text, {
+            chat_id: chatId,
+            message_id: messageId,
+            parse_mode: 'MarkdownV2',
+            reply_markup: keyboard
+        });
+    } else {
+        bot.sendMessage(chatId, text, { 
+            parse_mode: 'MarkdownV2', 
+            reply_markup: keyboard 
+        });
+    }
+}
+
 // ================================================================
 // SCAN HANDLER
 // ================================================================
 
-async function handleScan(chatId, tokenAddress, messageId = null) {
+async function handleScan(chatId, tokenAddress, chainKey = null, messageId = null) {
+    // Use user's preferred chain if not specified
+    const chain = chainKey || getUserChain(chatId);
+    const chainConfig = getChain(chain);
+    const chainEmoji = getChainEmoji(chain);
+    
     let loadingMsg;
     if (messageId) {
-        await bot.editMessageText('🔍 Scanning\\.\\.\\.', {
+        await bot.editMessageText(`🔍 Scanning on ${chainEmoji} ${esc(chainConfig?.name || 'Unknown')}\\.\\.\\.`, {
             chat_id: chatId,
             message_id: messageId,
             parse_mode: 'MarkdownV2'
         });
         loadingMsg = { message_id: messageId };
     } else {
-        loadingMsg = await bot.sendMessage(chatId, '🔍 Scanning\\.\\.\\.', { parse_mode: 'MarkdownV2' });
+        loadingMsg = await bot.sendMessage(chatId, `🔍 Scanning on ${chainEmoji} ${esc(chainConfig?.name || 'Unknown')}\\.\\.\\.`, { parse_mode: 'MarkdownV2' });
     }
     
     try {
-        const scanData = await silentScan(tokenAddress);
+        const scanData = await silentScan(tokenAddress, chain);
         
         // Cache for button callbacks
-        const cacheKey = `${chatId}_${tokenAddress}`;
+        const cacheKey = `${chatId}_${tokenAddress}_${chain}`;
         scanCache.set(cacheKey, scanData);
         
         if (scanCache.size > 100) {
@@ -668,16 +766,25 @@ async function handleScan(chatId, tokenAddress, messageId = null) {
         
         const summary = formatSummary(tokenAddress, scanData);
         
-        // Build keyboard
+        // Build keyboard with chain-specific links
+        const dexScreenerChain = chainConfig?.apis?.dexscreener || 'ethereum';
+        const explorerUrl = chainConfig?.explorer?.url || 'https://etherscan.io';
+        
         const keyboard = {
             inline_keyboard: [
                 [
-                    { text: '📋 Full Report', callback_data: `full_${tokenAddress}` },
-                    { text: '🔄 Rescan', callback_data: `scan_${tokenAddress}` }
+                    { text: '📋 Full Report', callback_data: `full_${chain}_${tokenAddress}` },
+                    { text: '🔄 Rescan', callback_data: `scan_${chain}_${tokenAddress}` }
                 ],
                 [
-                    { text: '📊 DexScreener', url: `https://dexscreener.com/ethereum/${tokenAddress}` },
-                    { text: '🔍 Etherscan', url: `https://etherscan.io/token/${tokenAddress}` }
+                    { text: '📊 DexScreener', url: `https://dexscreener.com/${dexScreenerChain}/${tokenAddress}` },
+                    { text: '🔍 Explorer', url: `${explorerUrl}/token/${tokenAddress}` }
+                ],
+                [
+                    { text: '🔀 Scan Another Token', callback_data: `scanother_${chain}` },
+                ],
+                [
+                    { text: '⛓️ Choose Another Chain', callback_data: 'chains' }
                 ]
             ]
         };
@@ -700,7 +807,7 @@ async function handleScan(chatId, tokenAddress, messageId = null) {
             });
             
             if (socialButtons.length > 0) {
-                keyboard.inline_keyboard.push(socialButtons);
+                keyboard.inline_keyboard.splice(2, 0, socialButtons);
             }
         }
         
@@ -712,7 +819,7 @@ async function handleScan(chatId, tokenAddress, messageId = null) {
             disable_web_page_preview: true
         });
         
-        console.log(`✓ Scanned: ${tokenAddress} - ${scanData.riskLevel}`);
+        console.log(`✓ Scanned: ${tokenAddress} on ${chain} - ${scanData.riskLevel}`);
         
     } catch (error) {
         console.error(`✗ Error: ${error.message}`);
@@ -740,13 +847,15 @@ bot.on('callback_query', async (query) => {
         // Ignore - query may have expired
     }
     
+    // Help
     if (data === 'help') {
         bot.sendMessage(chatId, `
 *How to use:*
 
-1\\. Paste a token contract address
-2\\. Get instant summary
-3\\. Click "Full Report" for details
+1\\. Select your chain with /chain
+2\\. Paste a token contract address
+3\\. Get instant summary
+4\\. Click "Full Report" for details
 
 *What I check:*
 • Honeypot status
@@ -759,39 +868,113 @@ bot.on('callback_query', async (query) => {
         return;
     }
     
+    // Show chain selector
+    if (data === 'chains') {
+        showChainSelector(chatId, messageId);
+        return;
+    }
+    
+    // Chain selection
+    if (data.startsWith('chain_')) {
+        const chainKey = data.replace('chain_', '');
+        setUserChain(chatId, chainKey);
+        
+        const chainConfig = getChain(chainKey);
+        const chainEmoji = getChainEmoji(chainKey);
+        
+        const chainConfirmKeyboard = {
+            inline_keyboard: [
+                [{ text: '⛓️ Choose Another Chain', callback_data: 'chains' }]
+            ]
+        };
+        
+        await bot.editMessageText(
+            `✅ Chain set to ${chainEmoji} *${esc(chainConfig?.name || 'Unknown')}*\n\nNow paste a token address to scan\\!`,
+            {
+                chat_id: chatId,
+                message_id: messageId,
+                parse_mode: 'MarkdownV2',
+                reply_markup: chainConfirmKeyboard
+            }
+        );
+        return;
+    }
+    
+    // Scan another token on the same chain
+    if (data.startsWith('scanother_')) {
+        const chainKey = data.replace('scanother_', '');
+        const chainConfig = getChain(chainKey);
+        const chainEmoji = getChainEmoji(chainKey);
+        
+        // Set user's chain to this one
+        setUserChain(chatId, chainKey);
+        
+        const keyboard = {
+            inline_keyboard: [
+                [{ text: '❌ Cancel', callback_data: 'cancel' }]
+            ]
+        };
+        
+        await bot.editMessageText(
+            `🔀 *Scan Another Token*\n\n${chainEmoji} Chain: *${esc(chainConfig?.name || 'Unknown')}*\n\nPaste a token contract address to scan:`,
+            {
+                chat_id: chatId,
+                message_id: messageId,
+                parse_mode: 'MarkdownV2',
+                reply_markup: keyboard
+            }
+        );
+        return;
+    }
+    
+    // Cancel
+    if (data === 'cancel') {
+        await bot.deleteMessage(chatId, messageId);
+        return;
+    }
+    
     // Full report
     if (data.startsWith('full_')) {
-        const tokenAddress = data.replace('full_', '');
-        const cacheKey = `${chatId}_${tokenAddress}`;
+        const parts = data.replace('full_', '').split('_');
+        const chain = parts[0];
+        const tokenAddress = parts.slice(1).join('_');
+        const cacheKey = `${chatId}_${tokenAddress}_${chain}`;
         const scanData = scanCache.get(cacheKey);
         
         if (!scanData) {
-            await handleScan(chatId, tokenAddress, messageId);
+            await handleScan(chatId, tokenAddress, chain, messageId);
             return;
         }
         
         try {
             const fullReport = formatFullReport(tokenAddress, scanData);
+            const chainConfig = getChain(chain);
+            const dexScreenerChain = chainConfig?.apis?.dexscreener || 'ethereum';
+            const explorerUrl = chainConfig?.explorer?.url || 'https://etherscan.io';
             
             const keyboard = {
                 inline_keyboard: [
                     [
-                        { text: '📊 Summary', callback_data: `summary_${tokenAddress}` },
-                        { text: '🔄 Rescan', callback_data: `scan_${tokenAddress}` }
+                        { text: '📊 Summary', callback_data: `summary_${chain}_${tokenAddress}` },
+                        { text: '🔄 Rescan', callback_data: `scan_${chain}_${tokenAddress}` }
                     ],
                     [
-                        { text: '📊 DexScreener', url: `https://dexscreener.com/ethereum/${tokenAddress}` },
-                        { text: '🔍 Etherscan', url: `https://etherscan.io/token/${tokenAddress}` }
+                        { text: '📊 DexScreener', url: `https://dexscreener.com/${dexScreenerChain}/${tokenAddress}` },
+                        { text: '🔍 Explorer', url: `${explorerUrl}/token/${tokenAddress}` }
+                    ],
+                    [
+                        { text: '🔀 Scan Another Token', callback_data: `scanother_${chain}` }
+                    ],
+                    [
+                        { text: '⛓️ Choose Another Chain', callback_data: 'chains' }
                     ]
                 ]
             };
             
             // Telegram has 4096 char limit - split if needed
             if (fullReport.length > 4000) {
-                // Delete original message
                 await bot.deleteMessage(chatId, messageId);
                 
-                // Split into chunks
                 const chunks = [];
                 let current = '';
                 const lines = fullReport.split('\n');
@@ -806,7 +989,6 @@ bot.on('callback_query', async (query) => {
                 }
                 if (current) chunks.push(current);
                 
-                // Send chunks
                 for (let i = 0; i < chunks.length; i++) {
                     const isLast = i === chunks.length - 1;
                     await bot.sendMessage(chatId, chunks[i], {
@@ -835,26 +1017,37 @@ bot.on('callback_query', async (query) => {
     
     // Back to summary
     if (data.startsWith('summary_')) {
-        const tokenAddress = data.replace('summary_', '');
-        const cacheKey = `${chatId}_${tokenAddress}`;
+        const parts = data.replace('summary_', '').split('_');
+        const chain = parts[0];
+        const tokenAddress = parts.slice(1).join('_');
+        const cacheKey = `${chatId}_${tokenAddress}_${chain}`;
         const scanData = scanCache.get(cacheKey);
         
         if (!scanData) {
-            await handleScan(chatId, tokenAddress, messageId);
+            await handleScan(chatId, tokenAddress, chain, messageId);
             return;
         }
         
         const summary = formatSummary(tokenAddress, scanData);
+        const chainConfig = getChain(chain);
+        const dexScreenerChain = chainConfig?.apis?.dexscreener || 'ethereum';
+        const explorerUrl = chainConfig?.explorer?.url || 'https://etherscan.io';
         
         const keyboard = {
             inline_keyboard: [
                 [
-                    { text: '📋 Full Report', callback_data: `full_${tokenAddress}` },
-                    { text: '🔄 Rescan', callback_data: `scan_${tokenAddress}` }
+                    { text: '📋 Full Report', callback_data: `full_${chain}_${tokenAddress}` },
+                    { text: '🔄 Rescan', callback_data: `scan_${chain}_${tokenAddress}` }
                 ],
                 [
-                    { text: '📊 DexScreener', url: `https://dexscreener.com/ethereum/${tokenAddress}` },
-                    { text: '🔍 Etherscan', url: `https://etherscan.io/token/${tokenAddress}` }
+                    { text: '📊 DexScreener', url: `https://dexscreener.com/${dexScreenerChain}/${tokenAddress}` },
+                    { text: '🔍 Explorer', url: `${explorerUrl}/token/${tokenAddress}` }
+                ],
+                [
+                    { text: '🔀 Scan Another Token', callback_data: `scanother_${chain}` }
+                ],
+                [
+                    { text: '⛓️ Choose Another Chain', callback_data: 'chains' }
                 ]
             ]
         };
@@ -869,10 +1062,12 @@ bot.on('callback_query', async (query) => {
         return;
     }
     
-    // Rescan
+    // Rescan / Scan on specific chain
     if (data.startsWith('scan_')) {
-        const tokenAddress = data.replace('scan_', '');
-        await handleScan(chatId, tokenAddress, messageId);
+        const parts = data.replace('scan_', '').split('_');
+        const chain = parts[0];
+        const tokenAddress = parts.slice(1).join('_');
+        await handleScan(chatId, tokenAddress, chain, messageId);
         return;
     }
 });
@@ -891,5 +1086,6 @@ bot.on('message', async (msg) => {
     }
 });
 
-console.log('Ready! Commands: /start, /help');
+console.log('Ready! Commands: /start, /help, /chain');
 console.log('Or just paste a token address.\n');
+console.log('Supported chains:', getSupportedChains().map(c => c.shortName).join(', '));

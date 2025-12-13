@@ -1,27 +1,24 @@
 
 // ================================================================
-// RUG CHECKER - Unified Token Security Scanner
+// RUG CHECKER - Unified Token Security Scanner (Multi-Chain)
 // ================================================================
 // Combines all analysis modules into one comprehensive report
+// Supports: ETH, BSC, Base, Polygon, Arbitrum, Avalanche, and more
 // ================================================================
 
 const { ethers } = require('ethers');
 const https = require('https');
+const { CHAINS, BURN_ADDRESSES, getChain, getSupportedChains, DEFAULT_CHAIN } = require('./chains');
 
 // ================================================================
 // CONFIGURATION
 // ================================================================
 
-// Moralis API for holder data
+// Moralis API for holder data (works across chains)
 const MORALIS_API = 'https://deep-index.moralis.io/api/v2.2';
 const MORALIS_API_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6ImU2MTU4NjFmLWNmNzctNGVjNS04MTEwLWVmZTYxYzNiNWI4MCIsIm9yZ0lkIjoiNDg1MTgzIiwidXNlcklkIjoiNDk5MTYyIiwidHlwZUlkIjoiYzk5NDU2Y2EtZjA0Zi00OTM2LWJhZGEtMzE1ZTkyMTU3M2M0IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NjUyMzQzNzgsImV4cCI6NDkyMDk5NDM3OH0.ln9HWATfvheKJTDBW9SgdPJLTsxmLyl4jmRQ7LvXOyo';
 
-// Etherscan API for contract data
-const ETHERSCAN_API = 'https://api.etherscan.io/v2/api';
-const ETHERSCAN_API_KEY = 'K6K49AIR8VNA9WWMWZ1M9CZTV6BNRYETZ5';
-const CHAIN_ID = '1';
-
-// Security API for honeypot detection
+// Security API for honeypot detection (GoPlus - works across chains)
 const SECURITY_API = 'https://api.gopluslabs.io/api/v1/token_security';
 
 // DexScreener API for social links and sentiment (free, no key required)
@@ -30,32 +27,7 @@ const DEXSCREENER_API = 'https://api.dexscreener.com/latest/dex';
 // CoinGecko API for real-time prices (free, no key required)
 const COINGECKO_API = 'https://api.coingecko.com/api/v3';
 
-// RPC for blockchain calls
-const RPC_URL = 'https://ethereum-rpc.publicnode.com';
-const provider = new ethers.JsonRpcProvider(RPC_URL);
-
-// Uniswap V2 Factory
-const UNISWAP_V2_FACTORY = '0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f';
-const WETH = '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2';
-
-// Known addresses
-const BURN_ADDRESSES = [
-    '0x0000000000000000000000000000000000000000',
-    '0x000000000000000000000000000000000000dead',
-    '0xdead000000000000000042069420694206942069', // Common dead address variant
-    '0x0000000000000000000000000000000000000001',
-];
-
-const KNOWN_LOCKERS = [
-    '0x663A5C229c09b049E36dCc11a9B0d4a8Eb9db214', // Unicrypt
-    '0x71B5759d73262FBb223956913ecF4ecC51057641', // PinkLock
-    '0xE2fE530C047f2d85298b07D9333C05737f1435fB', // Team.Finance
-    '0xDba68f07d1b7Ca219f78ae8582C213d975c25cAf', // Mudra Locker
-    '0x407993575c91ce7643a4d4cCACc9A98c36eE1BBE', // PinkLock V2
-    '0x5E5b9bE5fd939c578ABE5800a90C566eeEbA44a5', // Gempad
-];
-
-// ABIs
+// ABIs (same across all EVM chains)
 const ERC20_ABI = [
     'function name() view returns (string)',
     'function symbol() view returns (string)',
@@ -88,48 +60,124 @@ const DANGEROUS_KEYWORDS = {
 };
 
 // ================================================================
+// CHAIN CONTEXT - Dynamic provider and config per chain
+// ================================================================
+
+// Cache providers to avoid recreating
+const providerCache = new Map();
+const failedRpcs = new Set(); // Track failed RPCs to avoid retrying
+
+function getProvider(chainKey) {
+    const chain = getChain(chainKey);
+    if (!chain) {
+        throw new Error(`Unsupported chain: ${chainKey}`);
+    }
+    
+    // Check if we need to try a backup RPC
+    const cacheKey = `${chainKey}_provider`;
+    if (!providerCache.has(cacheKey)) {
+        // Build list of RPCs to try (primary + backups)
+        const rpcsToTry = [chain.rpc];
+        if (chain.rpcBackup && chain.rpcBackup.length > 0) {
+            rpcsToTry.push(...chain.rpcBackup);
+        }
+        
+        // Use first non-failed RPC, or primary if all failed
+        let rpcUrl = chain.rpc;
+        for (const rpc of rpcsToTry) {
+            if (!failedRpcs.has(rpc)) {
+                rpcUrl = rpc;
+                break;
+            }
+        }
+        
+        providerCache.set(cacheKey, new ethers.JsonRpcProvider(rpcUrl));
+    }
+    return providerCache.get(cacheKey);
+}
+
+// Switch to backup RPC if primary fails
+function switchToBackupRpc(chainKey) {
+    const chain = getChain(chainKey);
+    if (!chain) return;
+    
+    const cacheKey = `${chainKey}_provider`;
+    
+    // Mark current RPC as failed
+    failedRpcs.add(chain.rpc);
+    
+    // Try backup RPCs
+    if (chain.rpcBackup && chain.rpcBackup.length > 0) {
+        for (const backupRpc of chain.rpcBackup) {
+            if (!failedRpcs.has(backupRpc)) {
+                console.log(`   [!] Switching to backup RPC: ${backupRpc}`);
+                providerCache.set(cacheKey, new ethers.JsonRpcProvider(backupRpc));
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+function getChainConfig(chainKey) {
+    const chain = getChain(chainKey);
+    if (!chain) {
+        throw new Error(`Unsupported chain: ${chainKey}. Supported: ${getSupportedChains().map(c => c.key).join(', ')}`);
+    }
+    return chain;
+}
+
+// ================================================================
 // HELPER FUNCTIONS
 // ================================================================
 
-// Cache for ETH price (refreshes every 60 seconds)
-let cachedEthPrice = null;
-let ethPriceLastFetch = 0;
-const ETH_PRICE_CACHE_DURATION = 60000; // 1 minute
+// Cache for native token prices (refreshes every 60 seconds)
+const priceCache = new Map();
+const PRICE_CACHE_DURATION = 60000; // 1 minute
 
-async function getEthPrice() {
-    const now = Date.now();
+async function getNativeTokenPrice(chainKey) {
+    const chain = getChainConfig(chainKey);
+    const cacheKey = chain.native.coingeckoId;
+    const cached = priceCache.get(cacheKey);
     
-    // Return cached price if still valid
-    if (cachedEthPrice && (now - ethPriceLastFetch) < ETH_PRICE_CACHE_DURATION) {
-        return cachedEthPrice;
+    if (cached && (Date.now() - cached.time) < PRICE_CACHE_DURATION) {
+        return cached.price;
     }
     
     try {
         // Try CoinGecko first
-        const url = `${COINGECKO_API}/simple/price?ids=ethereum&vs_currencies=usd`;
+        const url = `${COINGECKO_API}/simple/price?ids=${chain.native.coingeckoId}&vs_currencies=usd`;
         const response = await fetchJSON(url);
         
-        if (response?.ethereum?.usd) {
-            cachedEthPrice = response.ethereum.usd;
-            ethPriceLastFetch = now;
-            return cachedEthPrice;
+        if (response?.[chain.native.coingeckoId]?.usd) {
+            const price = response[chain.native.coingeckoId].usd;
+            priceCache.set(cacheKey, { price, time: Date.now() });
+            return price;
         }
     } catch (error) {
-        // CoinGecko failed, try DexScreener ETH/USDC pair
+        // CoinGecko failed, try DexScreener for wrapped token
         try {
-            const dexUrl = `${DEXSCREENER_API}/pairs/ethereum/0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640`;
+            const dexUrl = `${DEXSCREENER_API}/tokens/${chain.native.wrapped}`;
             const dexResponse = await fetchJSON(dexUrl);
-            if (dexResponse?.pair?.priceUsd) {
-                cachedEthPrice = parseFloat(dexResponse.pair.priceUsd);
-                ethPriceLastFetch = now;
-                return cachedEthPrice;
+            if (dexResponse?.pairs?.[0]?.priceUsd) {
+                const price = parseFloat(dexResponse.pairs[0].priceUsd);
+                priceCache.set(cacheKey, { price, time: Date.now() });
+                return price;
             }
         } catch {}
     }
     
-    // Fallback to a reasonable default if all APIs fail
-    console.log('   [!] Could not fetch live ETH price, using fallback');
-    return cachedEthPrice || 3500; // Use last known or fallback
+    // Fallback defaults
+    const fallbacks = {
+        'ethereum': 3500,
+        'binancecoin': 600,
+        'matic-network': 0.8,
+        'avalanche-2': 35,
+        'fantom': 0.5
+    };
+    
+    console.log(`   [!] Could not fetch live ${chain.native.symbol} price, using fallback`);
+    return fallbacks[chain.native.coingeckoId] || 1;
 }
 
 function formatSmallNumber(num) {
@@ -137,13 +185,9 @@ function formatSmallNumber(num) {
     if (num >= 1) {
         return num.toLocaleString('en-US', { maximumFractionDigits: 6 });
     }
-    // For very small numbers, show up to 18 decimal places
     const str = num.toFixed(18);
-    // Remove trailing zeros but keep at least some precision
     const trimmed = str.replace(/\.?0+$/, '');
-    // If the number is very small, show it properly
     if (trimmed === '0') {
-        // Find first non-zero digit position
         const match = str.match(/0\.(0*)([1-9])/);
         if (match) {
             const zeros = match[1].length;
@@ -155,9 +199,7 @@ function formatSmallNumber(num) {
 
 function isBurnAddress(address) {
     const addr = address.toLowerCase();
-    // Check exact matches
     if (BURN_ADDRESSES.some(ex => ex.toLowerCase() === addr)) return true;
-    // Check if starts with 0xdead or is zero address
     if (addr.startsWith('0xdead')) return true;
     if (addr === '0x0000000000000000000000000000000000000000') return true;
     return false;
@@ -165,7 +207,17 @@ function isBurnAddress(address) {
 
 async function fetchJSON(url, options = {}) {
     return new Promise((resolve) => {
-        const request = https.get(url, options, (response) => {
+        const urlObj = new URL(url);
+        const requestOptions = {
+            hostname: urlObj.hostname,
+            path: urlObj.pathname + urlObj.search,
+            method: options.method || 'GET',
+            headers: options.headers || {}
+        };
+        
+        const protocol = urlObj.protocol === 'https:' ? https : require('http');
+        
+        const request = protocol.request(requestOptions, (response) => {
             let data = '';
             response.on('data', chunk => data += chunk);
             response.on('end', () => {
@@ -178,6 +230,7 @@ async function fetchJSON(url, options = {}) {
         });
         request.on('error', () => resolve(null));
         request.setTimeout(15000, () => { request.destroy(); resolve(null); });
+        request.end();
     });
 }
 
@@ -191,7 +244,10 @@ function printSection(title, status) {
 // MODULE 1: BASIC TOKEN INFO (Enhanced with Age)
 // ================================================================
 
-async function checkTokenInfo(tokenAddress) {
+async function checkTokenInfo(tokenAddress, chainKey = DEFAULT_CHAIN) {
+    const chain = getChainConfig(chainKey);
+    const provider = getProvider(chainKey);
+    
     try {
         const token = new ethers.Contract(tokenAddress, ERC20_ABI, provider);
         
@@ -218,31 +274,27 @@ async function checkTokenInfo(tokenAddress) {
             ownerStatus = 'no-owner-function';
         }
         
-        // Get contract age (from first transaction)
+        // Get contract age (from first transaction) - only if explorer API key available
         let contractAge = null;
         let creationDate = null;
-        try {
-            const url = `${ETHERSCAN_API}?chainid=${CHAIN_ID}&module=account&action=txlist&address=${tokenAddress}&startblock=0&endblock=99999999&page=1&offset=1&sort=asc&apikey=${ETHERSCAN_API_KEY}`;
-            const data = await fetchJSON(url);
-            if (data?.result?.[0]) {
-                const timestamp = parseInt(data.result[0].timeStamp);
-                creationDate = new Date(timestamp * 1000);
-                const ageMs = Date.now() - creationDate.getTime();
-                const ageDays = Math.floor(ageMs / (1000 * 60 * 60 * 24));
-                contractAge = ageDays;
-            }
-        } catch {}
+        
+        if (chain.explorer.apiKey) {
+            try {
+                const url = `${chain.explorer.api}?chainid=${chain.chainId}&module=account&action=txlist&address=${tokenAddress}&startblock=0&endblock=99999999&page=1&offset=1&sort=asc&apikey=${chain.explorer.apiKey}`;
+                const data = await fetchJSON(url);
+                if (data?.result?.[0]) {
+                    const timestamp = parseInt(data.result[0].timeStamp);
+                    creationDate = new Date(timestamp * 1000);
+                    const ageMs = Date.now() - creationDate.getTime();
+                    const ageDays = Math.floor(ageMs / (1000 * 60 * 60 * 24));
+                    contractAge = ageDays;
+                }
+            } catch {}
+        }
         
         // Calculate burned supply
         let burnedSupply = 0;
-        const burnAddressesToCheck = [
-            '0x0000000000000000000000000000000000000000',
-            '0x000000000000000000000000000000000000dEaD',
-            '0xdead000000000000000042069420694206942069',
-            '0x0000000000000000000000000000000000000001',
-        ];
-        
-        for (const burnAddr of burnAddressesToCheck) {
+        for (const burnAddr of BURN_ADDRESSES) {
             try {
                 const balance = await token.balanceOf(burnAddr);
                 burnedSupply += Number(ethers.formatUnits(balance, decimals));
@@ -255,6 +307,8 @@ async function checkTokenInfo(tokenAddress) {
         
         return {
             success: true,
+            chain: chainKey,
+            chainName: chain.name,
             name,
             symbol,
             decimals,
@@ -270,7 +324,7 @@ async function checkTokenInfo(tokenAddress) {
             risk: ownerStatus === 'active' ? 'MEDIUM' : 'LOW'
         };
     } catch (error) {
-        return { success: false, error: error.message, risk: 'UNKNOWN' };
+        return { success: false, error: error.message, risk: 'UNKNOWN', chain: chainKey };
     }
 }
 
@@ -278,8 +332,15 @@ async function checkTokenInfo(tokenAddress) {
 // MODULE 2: ABI FUNCTION SCAN
 // ================================================================
 
-async function checkContractFunctions(tokenAddress) {
-    const url = `${ETHERSCAN_API}?chainid=${CHAIN_ID}&module=contract&action=getabi&address=${tokenAddress}&apikey=${ETHERSCAN_API_KEY}`;
+async function checkContractFunctions(tokenAddress, chainKey = DEFAULT_CHAIN) {
+    const chain = getChainConfig(chainKey);
+    
+    // Skip if no API key
+    if (!chain.explorer.apiKey) {
+        return { success: false, verified: false, risk: 'UNKNOWN', note: 'No explorer API key configured' };
+    }
+    
+    const url = `${chain.explorer.api}?chainid=${chain.chainId}&module=contract&action=getabi&address=${tokenAddress}&apikey=${chain.explorer.apiKey}`;
     
     try {
         const result = await fetchJSON(url);
@@ -329,12 +390,15 @@ async function checkContractFunctions(tokenAddress) {
 // MODULE 3: LIQUIDITY ANALYSIS (Enhanced with Price & Market Cap)
 // ================================================================
 
-async function checkLiquidity(tokenAddress, tokenInfo) {
+async function checkLiquidity(tokenAddress, tokenInfo, chainKey = DEFAULT_CHAIN) {
+    const chain = getChainConfig(chainKey);
+    const provider = getProvider(chainKey);
+    
     try {
         // First, get real-time price from DexScreener (aggregates all DEXes)
         let dexScreenerData = null;
         let priceInUSD = 0;
-        let priceInETH = 0;
+        let priceInNative = 0;
         let dexScreenerLiquidity = 0;
         let mainDex = 'Unknown';
         let mainPairAddress = null;
@@ -344,61 +408,92 @@ async function checkLiquidity(tokenAddress, tokenInfo) {
             const dexResponse = await fetchJSON(dexUrl);
             
             if (dexResponse?.pairs && dexResponse.pairs.length > 0) {
-                // Sort by liquidity to get the main pair
-                const sortedPairs = dexResponse.pairs.sort((a, b) => 
-                    (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0)
+                // Filter pairs for this chain and sort by liquidity
+                const chainPairs = dexResponse.pairs.filter(p => 
+                    p.chainId === chain.apis.dexscreener
                 );
-                const mainPair = sortedPairs[0];
                 
-                dexScreenerData = mainPair;
-                priceInUSD = parseFloat(mainPair.priceUsd) || 0;
-                priceInETH = parseFloat(mainPair.priceNative) || 0;
-                dexScreenerLiquidity = mainPair.liquidity?.usd || 0;
-                mainDex = mainPair.dexId || 'Unknown';
-                mainPairAddress = mainPair.pairAddress;
+                if (chainPairs.length > 0) {
+                    const sortedPairs = chainPairs.sort((a, b) => 
+                        (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0)
+                    );
+                    const mainPair = sortedPairs[0];
+                    
+                    dexScreenerData = mainPair;
+                    priceInUSD = parseFloat(mainPair.priceUsd) || 0;
+                    priceInNative = parseFloat(mainPair.priceNative) || 0;
+                    dexScreenerLiquidity = mainPair.liquidity?.usd || 0;
+                    mainDex = mainPair.dexId || 'Unknown';
+                    mainPairAddress = mainPair.pairAddress;
+                }
             }
         } catch {}
         
-        // Get real-time ETH price
-        const ethPrice = await getEthPrice();
+        // Get real-time native token price
+        const nativePrice = await getNativeTokenPrice(chainKey);
         
-        // If DexScreener didn't have price, try Uniswap V2 as fallback
-        let uniV2PairAddress = null;
-        let wethAmount = 0;
+        // If DexScreener didn't have price, try on-chain DEXes as fallback
+        let dexPairAddress = null;
+        let nativeAmount = 0;
         let tokenAmount = 0;
-        let uniV2Liquidity = 0;
+        let dexLiquidity = 0;
+        let foundDexName = '';
         
-        try {
-            const factory = new ethers.Contract(UNISWAP_V2_FACTORY, FACTORY_ABI, provider);
-            uniV2PairAddress = await factory.getPair(tokenAddress, WETH);
+        // Build list of all DEXes to check (primary + additional)
+        const dexesToCheck = [
+            { name: chain.dex.name, factory: chain.dex.factory }
+        ];
+        
+        // Add additional DEXes if configured (multi-DEX support)
+        if (chain.additionalDexes && chain.additionalDexes.length > 0) {
+            dexesToCheck.push(...chain.additionalDexes);
+        }
+        
+        // Try each DEX factory until we find a pair
+        for (const dex of dexesToCheck) {
+            if (!dex.factory || dex.factory === '0x0000000000000000000000000000000000000000') continue;
             
-            if (uniV2PairAddress !== '0x0000000000000000000000000000000000000000') {
-                const pair = new ethers.Contract(uniV2PairAddress, PAIR_ABI, provider);
-                const token0 = await pair.token0();
-                const reserves = await pair.getReserves();
+            try {
+                const factory = new ethers.Contract(dex.factory, FACTORY_ABI, provider);
+                const pairAddr = await factory.getPair(tokenAddress, chain.native.wrapped);
                 
-                let wethReserve, tokenReserve;
-                if (token0.toLowerCase() === WETH.toLowerCase()) {
-                    wethReserve = reserves[0];
-                    tokenReserve = reserves[1];
-                } else {
-                    wethReserve = reserves[1];
-                    tokenReserve = reserves[0];
+                if (pairAddr && pairAddr !== '0x0000000000000000000000000000000000000000') {
+                    const pair = new ethers.Contract(pairAddr, PAIR_ABI, provider);
+                    const token0 = await pair.token0();
+                    const reserves = await pair.getReserves();
+                    
+                    let nativeReserve, tokenReserve;
+                    if (token0.toLowerCase() === chain.native.wrapped.toLowerCase()) {
+                        nativeReserve = reserves[0];
+                        tokenReserve = reserves[1];
+                    } else {
+                        nativeReserve = reserves[1];
+                        tokenReserve = reserves[0];
+                    }
+                    
+                    const thisNativeAmount = Number(ethers.formatEther(nativeReserve));
+                    const thisTokenAmount = Number(ethers.formatUnits(tokenReserve, tokenInfo?.decimals || 18));
+                    const thisLiquidity = thisNativeAmount * nativePrice * 2;
+                    
+                    // Use this DEX if it has more liquidity than previous
+                    if (thisLiquidity > dexLiquidity) {
+                        dexPairAddress = pairAddr;
+                        nativeAmount = thisNativeAmount;
+                        tokenAmount = thisTokenAmount;
+                        dexLiquidity = thisLiquidity;
+                        foundDexName = dex.name;
+                        
+                        // If no DexScreener price, calculate from DEX
+                        if (priceInUSD === 0 && tokenAmount > 0) {
+                            priceInNative = nativeAmount / tokenAmount;
+                            priceInUSD = priceInNative * nativePrice;
+                            mainDex = dex.name;
+                            mainPairAddress = pairAddr;
+                        }
+                    }
                 }
-                
-                wethAmount = Number(ethers.formatEther(wethReserve));
-                tokenAmount = Number(ethers.formatUnits(tokenReserve, tokenInfo?.decimals || 18));
-                uniV2Liquidity = wethAmount * ethPrice * 2;
-                
-                // If no DexScreener price, calculate from Uniswap V2
-                if (priceInUSD === 0 && tokenAmount > 0) {
-                    priceInETH = wethAmount / tokenAmount;
-                    priceInUSD = priceInETH * ethPrice;
-                    mainDex = 'Uniswap V2';
-                    mainPairAddress = uniV2PairAddress;
-                }
-            }
-        } catch {}
+            } catch {}
+        }
         
         // If still no price data, return error
         if (priceInUSD === 0) {
@@ -406,43 +501,36 @@ async function checkLiquidity(tokenAddress, tokenInfo) {
         }
         
         // Use the higher liquidity value
-        const liquidityUSD = Math.max(dexScreenerLiquidity, uniV2Liquidity);
-        const pairAddress = mainPairAddress || uniV2PairAddress;
+        const liquidityUSD = Math.max(dexScreenerLiquidity, dexLiquidity);
+        const pairAddress = mainPairAddress || dexPairAddress;
         
         // Calculate market cap using circulating supply (total - burned)
         const totalSupplyNum = tokenInfo?.totalSupply ? parseFloat(tokenInfo.totalSupply.replace(/,/g, '')) : 0;
         const circulatingSupply = tokenInfo?.circulatingSupply || totalSupplyNum;
         const marketCap = priceInUSD * circulatingSupply;
-        const fdv = priceInUSD * totalSupplyNum; // Fully Diluted Valuation
+        const fdv = priceInUSD * totalSupplyNum;
         
-        // Check LP locks (only if we have a Uniswap V2 pair)
+        // Check LP locks (only if we have a DEX pair)
         let burnedPercent = 0;
         let lockedPercent = 0;
         let safePercent = 0;
         let atRiskPercent = 100;
         
-        if (uniV2PairAddress && uniV2PairAddress !== '0x0000000000000000000000000000000000000000') {
+        if (dexPairAddress && dexPairAddress !== '0x0000000000000000000000000000000000000000') {
             try {
-                const pair = new ethers.Contract(uniV2PairAddress, PAIR_ABI, provider);
+                const pair = new ethers.Contract(dexPairAddress, PAIR_ABI, provider);
                 const lpTotalSupply = await pair.totalSupply();
                 let burnedAmount = BigInt(0);
                 let lockedAmount = BigInt(0);
                 
-                const allBurnAddresses = [
-                    '0x0000000000000000000000000000000000000000',
-                    '0x000000000000000000000000000000000000dEaD',
-                    '0xdead000000000000000042069420694206942069',
-                    '0x0000000000000000000000000000000000000001',
-                ];
-                
-                for (const addr of allBurnAddresses) {
+                for (const addr of BURN_ADDRESSES) {
                     try {
                         const bal = await pair.balanceOf(addr);
                         burnedAmount += bal;
                     } catch {}
                 }
                 
-                for (const addr of KNOWN_LOCKERS) {
+                for (const addr of chain.lockers) {
                     try {
                         const bal = await pair.balanceOf(addr);
                         lockedAmount += bal;
@@ -467,12 +555,13 @@ async function checkLiquidity(tokenAddress, tokenInfo) {
             success: true,
             pairAddress,
             mainDex,
-            priceSource: dexScreenerData ? 'DexScreener (aggregated)' : 'Uniswap V2',
-            wethAmount,
+            priceSource: dexScreenerData ? 'DexScreener (aggregated)' : chain.dex.name,
+            nativeSymbol: chain.native.symbol,
+            nativeAmount,
             tokenAmount,
-            priceInETH,
+            priceInNative,
             priceInUSD,
-            ethPrice,
+            nativePrice,
             marketCap,
             fdv,
             circulatingSupply,
@@ -492,10 +581,12 @@ async function checkLiquidity(tokenAddress, tokenInfo) {
 // MODULE 4: HOLDER ANALYSIS
 // ================================================================
 
-async function checkHolders(tokenAddress) {
-    const url = `${MORALIS_API}/erc20/${tokenAddress}/owners?chain=eth&order=DESC&limit=20`;
+async function checkHolders(tokenAddress, chainKey = DEFAULT_CHAIN) {
+    const chain = getChainConfig(chainKey);
     
+    // Try Moralis first
     try {
+        const url = `${MORALIS_API}/erc20/${tokenAddress}/owners?chain=${chain.apis.moralis}&order=DESC&limit=20`;
         const response = await fetch(url, {
             method: 'GET',
             headers: {
@@ -506,58 +597,115 @@ async function checkHolders(tokenAddress) {
         
         const data = await response.json();
         
-        if (!data.result || data.result.length === 0) {
-            return { success: false, error: 'No holder data', risk: 'UNKNOWN' };
-        }
-        
-        let burnedPercent = 0;
-        let top1Percent = 0;
-        let top10Percent = 0;
-        const holders = [];
-        
-        for (let i = 0; i < data.result.length; i++) {
-            const holder = data.result[i];
-            const percent = parseFloat(holder.percentage_relative_to_total_supply) || 0;
-            const addr = holder.owner_address.toLowerCase();
+        if (data.result && data.result.length > 0) {
+            let burnedPercent = 0;
+            let top1Percent = 0;
+            let top10Percent = 0;
+            const holders = [];
             
-            if (isBurnAddress(addr)) {
-                burnedPercent += percent;
-                continue;
+            for (let i = 0; i < data.result.length; i++) {
+                const holder = data.result[i];
+                const percent = parseFloat(holder.percentage_relative_to_total_supply) || 0;
+                const addr = holder.owner_address.toLowerCase();
+                
+                if (isBurnAddress(addr)) {
+                    burnedPercent += percent;
+                    continue;
+                }
+                
+                holders.push({
+                    address: addr,
+                    percent: percent
+                });
+                
+                if (holders.length === 1) top1Percent = percent;
+                if (holders.length <= 10) top10Percent += percent;
             }
             
-            holders.push({
-                address: addr,
-                percent: percent
-            });
+            let risk = 'LOW';
+            if (top1Percent > 30) risk = 'CRITICAL';
+            else if (top1Percent > 20 || top10Percent > 70) risk = 'HIGH';
+            else if (top1Percent > 10 || top10Percent > 50) risk = 'MEDIUM';
             
-            if (holders.length === 1) top1Percent = percent;
-            if (holders.length <= 10) top10Percent += percent;
+            return {
+                success: true,
+                source: 'Moralis',
+                burnedPercent,
+                top1Percent,
+                top10Percent,
+                topHolders: holders.slice(0, 10),
+                risk
+            };
         }
-        
-        let risk = 'LOW';
-        if (top1Percent > 30) risk = 'CRITICAL';
-        else if (top1Percent > 20 || top10Percent > 70) risk = 'HIGH';
-        else if (top1Percent > 10 || top10Percent > 50) risk = 'MEDIUM';
-        
-        return {
-            success: true,
-            burnedPercent,
-            top1Percent,
-            top10Percent,
-            topHolders: holders.slice(0, 5),
-            risk
-        };
-    } catch (error) {
-        return { success: false, error: error.message, risk: 'UNKNOWN' };
+    } catch (e) {
+        // Moralis failed, try GoPlus
     }
+    
+    // Fallback to GoPlus
+    try {
+        const goPlusUrl = `${SECURITY_API}/${chain.apis.goplus}?contract_addresses=${tokenAddress.toLowerCase()}`;
+        const response = await fetchJSON(goPlusUrl);
+        
+        if (response && response.code === 1) {
+            const tokenData = response.result[tokenAddress.toLowerCase()];
+            
+            if (tokenData && tokenData.holders && tokenData.holders.length > 0) {
+                let burnedPercent = 0;
+                let top1Percent = 0;
+                let top10Percent = 0;
+                const holders = [];
+                
+                for (const h of tokenData.holders) {
+                    const percent = parseFloat(h.percent) * 100 || 0;
+                    const addr = (h.address || '').toLowerCase();
+                    
+                    if (isBurnAddress(addr)) {
+                        burnedPercent += percent;
+                        continue;
+                    }
+                    
+                    holders.push({
+                        address: addr,
+                        percent: percent,
+                        isContract: h.is_contract === 1,
+                        tag: h.tag || ''
+                    });
+                    
+                    if (holders.length === 1) top1Percent = percent;
+                    if (holders.length <= 10) top10Percent += percent;
+                }
+                
+                let risk = 'LOW';
+                if (top1Percent > 30) risk = 'CRITICAL';
+                else if (top1Percent > 20 || top10Percent > 70) risk = 'HIGH';
+                else if (top1Percent > 10 || top10Percent > 50) risk = 'MEDIUM';
+                
+                return {
+                    success: true,
+                    source: 'GoPlus',
+                    holderCount: parseInt(tokenData.holder_count) || 0,
+                    burnedPercent,
+                    top1Percent,
+                    top10Percent,
+                    topHolders: holders.slice(0, 10),
+                    risk
+                };
+            }
+        }
+    } catch (e) {
+        // GoPlus also failed
+    }
+    
+    return { success: false, error: 'No holder data available', risk: 'UNKNOWN' };
 }
 
 // ================================================================
 // MODULE 5: HONEYPOT DETECTION
 // ================================================================
 
-async function checkHoneypot(tokenAddress) {
-    const url = `${SECURITY_API}/${CHAIN_ID}?contract_addresses=${tokenAddress.toLowerCase()}`;
+async function checkHoneypot(tokenAddress, chainKey = DEFAULT_CHAIN) {
+    const chain = getChainConfig(chainKey);
+    const url = `${SECURITY_API}/${chain.apis.goplus}?contract_addresses=${tokenAddress.toLowerCase()}`;
     
     try {
         const response = await fetchJSON(url);
@@ -640,6 +788,22 @@ async function checkHoneypot(tokenAddress) {
         result.lpSafePercent = lpBurnedPercent + lpLockedPercent;
         result.lpDetails = lpDetails;
         
+        // Extract token holder data from GoPlus (fallback for Moralis)
+        result.holderCount = parseInt(tokenData.holder_count) || 0;
+        result.tokenHolders = [];
+        if (tokenData.holders && tokenData.holders.length > 0) {
+            for (const h of tokenData.holders) {
+                result.tokenHolders.push({
+                    address: h.address,
+                    percent: parseFloat(h.percent) * 100 || 0,
+                    balance: h.balance,
+                    isContract: h.is_contract === 1,
+                    isLocked: h.is_locked === 1,
+                    tag: h.tag || ''
+                });
+            }
+        }
+        
         // Categorize issues
         if (result.isHoneypot) result.issues.critical.push('HONEYPOT - Cannot sell');
         if (result.cannotBuy) result.issues.critical.push('Cannot buy');
@@ -691,7 +855,8 @@ async function checkHoneypot(tokenAddress) {
 // MODULE 6: SOCIAL & SENTIMENT (DexScreener API)
 // ================================================================
 
-async function checkSocialSentiment(tokenAddress) {
+async function checkSocialSentiment(tokenAddress, chainKey = DEFAULT_CHAIN) {
+    const chain = getChainConfig(chainKey);
     const url = `${DEXSCREENER_API}/tokens/${tokenAddress}`;
     
     try {
@@ -701,8 +866,16 @@ async function checkSocialSentiment(tokenAddress) {
             return { success: false, error: 'Token not found on DexScreener', risk: 'UNKNOWN' };
         }
         
-        // Get main pair (highest liquidity)
-        const pairs = response.pairs.sort((a, b) => 
+        // Filter pairs for this chain and get highest liquidity
+        const chainPairs = response.pairs.filter(p => 
+            p.chainId === chain.apis.dexscreener
+        );
+        
+        if (chainPairs.length === 0) {
+            return { success: false, error: `Token not found on ${chain.name}`, risk: 'UNKNOWN' };
+        }
+        
+        const pairs = chainPairs.sort((a, b) => 
             (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0)
         );
         const mainPair = pairs[0];
@@ -735,6 +908,7 @@ async function checkSocialSentiment(tokenAddress) {
             
             // URLs
             dexScreenerUrl: `https://dexscreener.com/${mainPair.chainId}/${mainPair.pairAddress}`,
+            explorerUrl: `${chain.explorer.url}/token/${tokenAddress}`,
             pairAddress: mainPair.pairAddress,
             dexId: mainPair.dexId,
             totalPairs: pairs.length
@@ -743,14 +917,12 @@ async function checkSocialSentiment(tokenAddress) {
         // Calculate sentiment score
         let sentimentScore = 50;
         
-        // Price momentum
         if (result.priceChange24h > 0) sentimentScore += Math.min(result.priceChange24h / 2, 15);
         else sentimentScore += Math.max(result.priceChange24h / 2, -15);
         
         if (result.priceChange1h > 0) sentimentScore += Math.min(result.priceChange1h / 2, 10);
         else sentimentScore += Math.max(result.priceChange1h / 2, -10);
         
-        // Buy/Sell ratio
         const totalBuys = result.txns24h.buys || 0;
         const totalSells = result.txns24h.sells || 0;
         const totalTxns = totalBuys + totalSells;
@@ -758,6 +930,16 @@ async function checkSocialSentiment(tokenAddress) {
         if (totalTxns > 0) {
             const buyRatio = totalBuys / totalTxns;
             sentimentScore += (buyRatio - 0.5) * 40;
+        }
+        
+        // Factor in volume - low volume is a negative signal
+        const volume24h = result.volume24h || 0;
+        if (volume24h < 1000) {
+            sentimentScore -= 15; // Very low volume
+        } else if (volume24h < 10000) {
+            sentimentScore -= 5; // Low volume
+        } else if (volume24h > 100000) {
+            sentimentScore += 5; // High volume
         }
         
         sentimentScore = Math.max(0, Math.min(100, sentimentScore));
@@ -785,13 +967,15 @@ async function checkSocialSentiment(tokenAddress) {
 // MAIN: RUN ALL CHECKS
 // ================================================================
 
-async function rugCheck(tokenAddress) {
+async function rugCheck(tokenAddress, chainKey = DEFAULT_CHAIN) {
+    const chain = getChainConfig(chainKey);
+    
     console.log('\n');
     console.log('='.repeat(60));
     console.log('   RUG CHECKER - Comprehensive Token Security Scan');
     console.log('='.repeat(60));
     console.log(`   Token: ${tokenAddress}`);
-    console.log(`   Chain: Ethereum Mainnet`);
+    console.log(`   Chain: ${chain.name} (${chain.shortName})`);
     console.log(`   Time:  ${new Date().toISOString()}`);
     console.log('='.repeat(60));
     
@@ -806,7 +990,7 @@ async function rugCheck(tokenAddress) {
     
     // ============ CHECK 1: TOKEN INFO ============
     printSection('1. TOKEN INFO', 'INFO');
-    results.tokenInfo = await checkTokenInfo(tokenAddress);
+    results.tokenInfo = await checkTokenInfo(tokenAddress, chainKey);
     
     if (results.tokenInfo.success) {
         console.log(`   Contract:     ${tokenAddress}`);
@@ -817,7 +1001,6 @@ async function rugCheck(tokenAddress) {
         console.log(`   Burned:       ${results.tokenInfo.burnedSupply.toLocaleString('en-US', { maximumFractionDigits: 2 })} (${results.tokenInfo.burnedPercent.toFixed(2)}%)`);
         console.log(`   Circulating:  ${results.tokenInfo.circulatingSupply.toLocaleString('en-US', { maximumFractionDigits: 2 })}`);
         
-        // Display owner with clear burn address identification
         if (results.tokenInfo.ownerStatus === 'renounced') {
             console.log(`   Owner:        ${results.tokenInfo.owner} [BURN ADDRESS]`);
             console.log(`   Owner Status: RENOUNCED (ownership burned)`);
@@ -845,7 +1028,7 @@ async function rugCheck(tokenAddress) {
     
     // ============ CHECK 2: CONTRACT FUNCTIONS ============
     printSection('2. CONTRACT FUNCTIONS', 'INFO');
-    results.contractScan = await checkContractFunctions(tokenAddress);
+    results.contractScan = await checkContractFunctions(tokenAddress, chainKey);
     
     if (results.contractScan.success) {
         console.log(`   Verified:     Yes`);
@@ -878,43 +1061,36 @@ async function rugCheck(tokenAddress) {
         console.log(`   `);
         console.log(`   Risk:         ${results.contractScan.risk}`);
     } else {
-        console.log(`   Verified:     No (contract not verified on Etherscan)`);
+        console.log(`   Verified:     No (contract not verified on ${chain.explorer.name})`);
         console.log(`   Note:         Unverified contracts are higher risk`);
         console.log(`   Risk:         ${results.contractScan.risk}`);
     }
     
     // ============ CHECK 3: LIQUIDITY ============
     printSection('3. LIQUIDITY & MARKET DATA', 'INFO');
-    results.liquidity = await checkLiquidity(tokenAddress, results.tokenInfo);
+    results.liquidity = await checkLiquidity(tokenAddress, results.tokenInfo, chainKey);
     
     if (results.liquidity.success) {
         console.log(`   PRICE & MARKET DATA:`);
-        console.log(`   ETH Price:    $${results.liquidity.ethPrice.toLocaleString('en-US', { maximumFractionDigits: 2 })}`);
-        console.log(`   Token Price:  $${formatSmallNumber(results.liquidity.priceInUSD)} / ${formatSmallNumber(results.liquidity.priceInETH)} ETH`);
+        console.log(`   ${chain.native.symbol} Price: $${results.liquidity.nativePrice.toLocaleString('en-US', { maximumFractionDigits: 2 })}`);
+        console.log(`   Token Price:  $${formatSmallNumber(results.liquidity.priceInUSD)} / ${formatSmallNumber(results.liquidity.priceInNative)} ${chain.native.symbol}`);
         console.log(`   Market Cap:   $${results.liquidity.marketCap.toLocaleString('en-US', { maximumFractionDigits: 0 })}`);
         console.log(`   FDV:          $${results.liquidity.fdv.toLocaleString('en-US', { maximumFractionDigits: 0 })}`);
         console.log(`   `);
         console.log(`   LIQUIDITY POOL:`);
         console.log(`   Pool Address: ${results.liquidity.pairAddress}`);
-        console.log(`   WETH in Pool: ${results.liquidity.wethAmount.toLocaleString('en-US', { maximumFractionDigits: 4 })} ETH`);
         console.log(`   Liquidity:    $${results.liquidity.liquidityUSD.toLocaleString('en-US', { maximumFractionDigits: 2 })}`);
-        console.log(`   `);
-        console.log(`   LP TOKEN SECURITY:`);
-        console.log(`   LP Burned:    ${results.liquidity.burnedPercent.toFixed(4)}%`);
-        console.log(`   LP Locked:    ${results.liquidity.lockedPercent.toFixed(4)}%`);
-        console.log(`   LP Safe:      ${results.liquidity.safePercent.toFixed(4)}%`);
-        console.log(`   LP At Risk:   ${results.liquidity.atRiskPercent.toFixed(4)}%`);
         console.log(`   `);
         console.log(`   Risk:         ${results.liquidity.risk}`);
     } else {
         console.log(`   Error: ${results.liquidity.error}`);
-        console.log(`   Note:  No WETH liquidity pool found on Uniswap V2`);
+        console.log(`   Note:  No ${chain.native.symbol} liquidity pool found on ${chain.dex.name}`);
         console.log(`   Risk:  ${results.liquidity.risk}`);
     }
     
     // ============ CHECK 4: HOLDERS ============
     printSection('4. HOLDER DISTRIBUTION', 'INFO');
-    results.holders = await checkHolders(tokenAddress);
+    results.holders = await checkHolders(tokenAddress, chainKey);
     
     if (results.holders.success) {
         console.log(`   SUPPLY DISTRIBUTION:`);
@@ -940,7 +1116,7 @@ async function rugCheck(tokenAddress) {
     
     // ============ CHECK 5: HONEYPOT ============
     printSection('5. HONEYPOT DETECTION', 'INFO');
-    results.honeypot = await checkHoneypot(tokenAddress);
+    results.honeypot = await checkHoneypot(tokenAddress, chainKey);
     
     if (results.honeypot.success) {
         console.log(`   HONEYPOT STATUS:`);
@@ -968,7 +1144,6 @@ async function rugCheck(tokenAddress) {
         console.log(`   Blacklist:    ${results.honeypot.isBlacklisted ? 'Yes' : 'No'}`);
         console.log(`   Anti-Whale:   ${results.honeypot.isAntiWhale ? 'Yes' : 'No'}`);
         
-        // LP Security
         if (results.honeypot.lpHolders && results.honeypot.lpHolders.length > 0) {
             console.log(`   `);
             console.log(`   LP SECURITY:`);
@@ -1007,7 +1182,7 @@ async function rugCheck(tokenAddress) {
     
     // ============ CHECK 6: SOCIAL & SENTIMENT ============
     printSection('6. SOCIAL & MARKET SENTIMENT', 'INFO');
-    results.sentiment = await checkSocialSentiment(tokenAddress);
+    results.sentiment = await checkSocialSentiment(tokenAddress, chainKey);
     
     if (results.sentiment.success) {
         console.log(`   PRICE ACTION:`);
@@ -1028,7 +1203,6 @@ async function rugCheck(tokenAddress) {
         console.log(`   Score:        ${results.sentiment.sentimentScore}/100`);
         console.log(`   Level:        ${results.sentiment.sentimentLevel}`);
         
-        // Social links
         if (results.sentiment.websites.length > 0 || results.sentiment.socials.length > 0) {
             console.log(`   `);
             console.log(`   SOCIAL LINKS:`);
@@ -1044,8 +1218,7 @@ async function rugCheck(tokenAddress) {
         console.log(`   `);
         console.log(`   QUICK LINKS:`);
         console.log(`     DexScreener: ${results.sentiment.dexScreenerUrl}`);
-        console.log(`     Etherscan:   https://etherscan.io/token/${tokenAddress}`);
-        console.log(`     DEXTools:    https://www.dextools.io/app/ether/pair-explorer/${results.sentiment.pairAddress}`);
+        console.log(`     Explorer:    ${results.sentiment.explorerUrl}`);
     } else {
         console.log(`   Error: ${results.sentiment.error}`);
         console.log(`   Note:  Token may not have liquidity pools yet`);
@@ -1060,25 +1233,22 @@ async function rugCheck(tokenAddress) {
     // Calculate detailed risk score (0-100, higher = more risky)
     let riskScore = 0;
     
-    // Token Info (max 20 points)
     if (results.tokenInfo?.success) {
         if (results.tokenInfo.ownerStatus === 'active') riskScore += 15;
         if (results.tokenInfo.contractAge !== null) {
-            if (results.tokenInfo.contractAge < 7) riskScore += 10; // Very new
-            else if (results.tokenInfo.contractAge < 30) riskScore += 5; // New
+            if (results.tokenInfo.contractAge < 7) riskScore += 10;
+            else if (results.tokenInfo.contractAge < 30) riskScore += 5;
         }
     }
     
-    // Contract Functions (max 30 points)
     if (results.contractScan?.success) {
         riskScore += results.contractScan.findings.critical.length * 10;
         riskScore += results.contractScan.findings.high.length * 5;
         riskScore += results.contractScan.findings.medium.length * 2;
     } else {
-        riskScore += 15; // Unverified contract is risky
+        riskScore += 15;
     }
     
-    // Liquidity (max 25 points)
     if (results.liquidity?.success) {
         if (results.liquidity.liquidityUSD < 1000) riskScore += 15;
         else if (results.liquidity.liquidityUSD < 10000) riskScore += 10;
@@ -1088,10 +1258,9 @@ async function rugCheck(tokenAddress) {
         else if (results.liquidity.safePercent < 50) riskScore += 7;
         else if (results.liquidity.safePercent < 80) riskScore += 3;
     } else {
-        riskScore += 20; // No liquidity = very risky
+        riskScore += 20;
     }
     
-    // Holders (max 25 points)
     if (results.holders?.success) {
         if (results.holders.top1Percent > 30) riskScore += 15;
         else if (results.holders.top1Percent > 20) riskScore += 10;
@@ -1101,26 +1270,22 @@ async function rugCheck(tokenAddress) {
         else if (results.holders.top10Percent > 50) riskScore += 5;
     }
     
-    // Honeypot (max 50 points - most critical)
     if (results.honeypot?.success) {
-        if (results.honeypot.isHoneypot) riskScore += 50; // Instant critical
+        if (results.honeypot.isHoneypot) riskScore += 50;
         if (results.honeypot.cannotBuy) riskScore += 20;
         if (results.honeypot.cannotSellAll) riskScore += 20;
         if (results.honeypot.ownerCanChangeBalance) riskScore += 15;
         if (results.honeypot.hiddenOwner) riskScore += 10;
         if (results.honeypot.canTakeBackOwnership) riskScore += 10;
         
-        // Tax penalties
         const sellTax = results.honeypot.sellTax || 0;
         if (sellTax > 50) riskScore += 25;
         else if (sellTax > 20) riskScore += 10;
         else if (sellTax > 10) riskScore += 5;
     }
     
-    // Cap at 100
     riskScore = Math.min(riskScore, 100);
     
-    // Determine text risk level
     let overallRisk;
     if (riskScore >= 75) {
         overallRisk = 'CRITICAL';
@@ -1154,7 +1319,6 @@ async function rugCheck(tokenAddress) {
     // Key findings
     console.log('\n   KEY FINDINGS:');
     
-    // Token age
     if (results.tokenInfo?.success && results.tokenInfo.contractAge !== null) {
         if (results.tokenInfo.contractAge < 7) {
             console.log(`   [!] Very new token (${results.tokenInfo.contractAge} days old) - HIGH RISK`);
@@ -1165,7 +1329,6 @@ async function rugCheck(tokenAddress) {
         }
     }
     
-    // Market cap
     if (results.liquidity?.success && results.liquidity.marketCap) {
         if (results.liquidity.marketCap < 100000) {
             console.log(`   [-] Very low market cap ($${results.liquidity.marketCap.toLocaleString('en-US', { maximumFractionDigits: 0 })})`);
@@ -1174,7 +1337,6 @@ async function rugCheck(tokenAddress) {
         }
     }
     
-    // Ownership
     if (results.tokenInfo?.success) {
         if (results.tokenInfo.ownerStatus === 'renounced') {
             console.log('   [+] Ownership BURNED to dead address (safe - no owner control)');
@@ -1185,7 +1347,6 @@ async function rugCheck(tokenAddress) {
         }
     }
     
-    // Contract functions
     if (results.contractScan?.success) {
         if (results.contractScan.findings.critical.length > 0) {
             console.log(`   [!] ${results.contractScan.findings.critical.length} CRITICAL functions found (mint/pause/etc)`);
@@ -1198,22 +1359,24 @@ async function rugCheck(tokenAddress) {
         }
     }
     
-    // Liquidity
     if (results.liquidity?.success) {
         if (results.liquidity.liquidityUSD > 100000) {
             console.log(`   [+] Good liquidity ($${results.liquidity.liquidityUSD.toLocaleString('en-US', { maximumFractionDigits: 0 })})`);
         } else if (results.liquidity.liquidityUSD < 10000) {
             console.log(`   [-] Low liquidity - hard to sell large amounts`);
         }
-        
-        if (results.liquidity.safePercent > 80) {
-            console.log(`   [+] ${results.liquidity.safePercent.toFixed(1)}% of LP is locked/burned`);
-        } else if (results.liquidity.safePercent < 50) {
-            console.log(`   [!] Only ${results.liquidity.safePercent.toFixed(1)}% of LP secured - RUG RISK`);
+    }
+    
+    // Use honeypot LP data (more reliable than on-chain)
+    if (results.honeypot?.success && results.honeypot.lpHolders?.length > 0) {
+        const lpSafe = (results.honeypot.lpBurnedPercent || 0) + (results.honeypot.lpLockedPercent || 0);
+        if (lpSafe > 80) {
+            console.log(`   [+] ${lpSafe.toFixed(1)}% of LP is locked/burned`);
+        } else if (lpSafe < 50) {
+            console.log(`   [!] Only ${lpSafe.toFixed(1)}% of LP secured - RUG RISK`);
         }
     }
     
-    // Holders
     if (results.holders?.success) {
         if (results.holders.burnedPercent > 30) {
             console.log(`   [+] ${results.holders.burnedPercent.toFixed(1)}% of supply burned`);
@@ -1226,7 +1389,6 @@ async function rugCheck(tokenAddress) {
         }
     }
     
-    // Honeypot
     if (results.honeypot?.success) {
         if (results.honeypot.isHoneypot) {
             console.log('   [!!!] HONEYPOT DETECTED - YOU CANNOT SELL THIS TOKEN');
@@ -1252,7 +1414,6 @@ async function rugCheck(tokenAddress) {
         }
     }
     
-    // Sentiment
     if (results.sentiment?.success) {
         const sentiment = results.sentiment.sentimentLevel;
         if (sentiment === 'VERY BULLISH') {
@@ -1265,7 +1426,6 @@ async function rugCheck(tokenAddress) {
             console.log(`   [i] Market sentiment: ${sentiment} (score: ${results.sentiment.sentimentScore}/100)`);
         }
         
-        // Buy ratio
         if (results.sentiment.buyRatio !== 'N/A') {
             const buyRatio = parseFloat(results.sentiment.buyRatio);
             if (buyRatio > 60) {
@@ -1275,7 +1435,6 @@ async function rugCheck(tokenAddress) {
             }
         }
         
-        // Social links presence
         const hasWebsite = results.sentiment.websites.length > 0;
         const hasSocials = results.sentiment.socials.length > 0;
         if (hasWebsite && hasSocials) {
@@ -1285,7 +1444,7 @@ async function rugCheck(tokenAddress) {
         }
     }
     
-    // Recommendations based on score
+    // Recommendations
     console.log('\n   RECOMMENDATIONS:');
     
     if (riskScore >= 75) {
@@ -1333,6 +1492,8 @@ async function rugCheck(tokenAddress) {
     
     return {
         tokenAddress,
+        chain: chainKey,
+        chainName: chain.name,
         results,
         overallRisk,
         riskScore
@@ -1343,41 +1504,48 @@ async function rugCheck(tokenAddress) {
 // CLI
 // ================================================================
 
-const tokenAddress = process.argv[2];
+const args = process.argv.slice(2);
+const tokenAddress = args[0];
+const chainArg = args[1] || DEFAULT_CHAIN;
 
 if (!tokenAddress) {
-    console.log('\nUsage: node rug-checker.js <TOKEN_ADDRESS>');
-    console.log('Example: node rug-checker.js 0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE\n');
-    console.log('This runs a comprehensive security scan including:');
-    console.log('  - Basic token info & ownership');
-    console.log('  - Contract function analysis');
-    console.log('  - Liquidity & LP lock status');
-    console.log('  - Holder concentration analysis\n');
+    console.log('\nUsage: node rug-checker.js <TOKEN_ADDRESS> [CHAIN]');
+    console.log('');
+    console.log('Examples:');
+    console.log('  node rug-checker.js 0x95aD61b0a150d79219dCF64E1E6Cc01f0B64C4cE eth');
+    console.log('  node rug-checker.js 0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82 bsc');
+    console.log('  node rug-checker.js 0x532f27101965dd16442e59d40670faf5ebb142e4 base');
+    console.log('');
+    console.log('Supported chains:');
+    getSupportedChains().forEach(c => {
+        console.log(`  ${c.key.padEnd(12)} - ${c.name}`);
+    });
+    console.log('');
 } else {
-    rugCheck(tokenAddress);
+    rugCheck(tokenAddress, chainArg);
 }
 
 // ================================================================
 // SILENT SCAN (Returns data without console output - for bot/API use)
 // ================================================================
 
-async function silentScan(tokenAddress) {
+async function silentScan(tokenAddress, chainKey = DEFAULT_CHAIN) {
+    const chain = getChainConfig(chainKey);
+    
     const results = {
-        tokenInfo: await checkTokenInfo(tokenAddress),
-        contractScan: await checkContractFunctions(tokenAddress),
+        tokenInfo: await checkTokenInfo(tokenAddress, chainKey),
+        contractScan: await checkContractFunctions(tokenAddress, chainKey),
         liquidity: null,
-        holders: await checkHolders(tokenAddress),
-        honeypot: await checkHoneypot(tokenAddress),
-        sentiment: await checkSocialSentiment(tokenAddress)
+        holders: await checkHolders(tokenAddress, chainKey),
+        honeypot: await checkHoneypot(tokenAddress, chainKey),
+        sentiment: await checkSocialSentiment(tokenAddress, chainKey)
     };
     
-    // Liquidity needs token info
-    results.liquidity = await checkLiquidity(tokenAddress, results.tokenInfo);
+    results.liquidity = await checkLiquidity(tokenAddress, results.tokenInfo, chainKey);
     
     // Calculate risk score
     let riskScore = 0;
     
-    // Token Info
     if (results.tokenInfo?.success) {
         if (results.tokenInfo.ownerStatus === 'active') riskScore += 15;
         if (results.tokenInfo.contractAge !== null) {
@@ -1386,7 +1554,6 @@ async function silentScan(tokenAddress) {
         }
     }
     
-    // Contract Functions
     if (results.contractScan?.success) {
         riskScore += results.contractScan.findings.critical.length * 10;
         riskScore += results.contractScan.findings.high.length * 5;
@@ -1395,7 +1562,6 @@ async function silentScan(tokenAddress) {
         riskScore += 15;
     }
     
-    // Liquidity
     if (results.liquidity?.success) {
         if (results.liquidity.liquidityUSD < 1000) riskScore += 15;
         else if (results.liquidity.liquidityUSD < 10000) riskScore += 10;
@@ -1408,7 +1574,6 @@ async function silentScan(tokenAddress) {
         riskScore += 20;
     }
     
-    // Holders
     if (results.holders?.success) {
         if (results.holders.top1Percent > 30) riskScore += 15;
         else if (results.holders.top1Percent > 20) riskScore += 10;
@@ -1418,7 +1583,6 @@ async function silentScan(tokenAddress) {
         else if (results.holders.top10Percent > 50) riskScore += 5;
     }
     
-    // Honeypot
     if (results.honeypot?.success) {
         if (results.honeypot.isHoneypot) riskScore += 50;
         if (results.honeypot.cannotBuy) riskScore += 20;
@@ -1443,6 +1607,8 @@ async function silentScan(tokenAddress) {
     
     return {
         tokenAddress,
+        chain: chainKey,
+        chainName: chain.name,
         results,
         riskScore,
         riskLevel,
@@ -1459,7 +1625,9 @@ module.exports = {
     checkHolders,
     checkHoneypot,
     checkSocialSentiment,
-    getEthPrice,
-    formatSmallNumber
+    getNativeTokenPrice,
+    formatSmallNumber,
+    getChain,
+    getSupportedChains,
+    DEFAULT_CHAIN
 };
-
