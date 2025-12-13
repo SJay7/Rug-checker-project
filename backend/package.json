@@ -2,13 +2,17 @@
   "name": "rug-checker",
   "version": "1.0.0",
   "description": "Token security scanner for detecting rug pulls",
-  "main": "src/rug-checker.js",
+  "main": "src/telegram-bot.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
+    "start": "node src/telegram-bot.js",
     "scan": "node src/rug-checker.js",
     "bot": "node src/telegram-bot.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": ["crypto", "rug-checker", "security", "defi"],
+  "keywords": ["crypto", "rug-checker", "security", "defi", "telegram-bot"],
   "author": "",
   "license": "ISC",
   "dependencies": {
