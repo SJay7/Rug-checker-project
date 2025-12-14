@@ -632,6 +632,27 @@ if (BOT_TOKEN === 'YOUR_BOT_TOKEN_HERE') {
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
+// ================================================================
+// CRASH PROTECTION - Keep bot running on errors
+// ================================================================
+
+// Handle polling errors (network issues, Telegram API errors)
+bot.on('polling_error', (error) => {
+    console.error('Polling error:', error.code || error.message);
+});
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+    console.error('Uncaught Exception:', error.message);
+    // Don't exit - keep running
+});
+
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('Unhandled Rejection:', reason);
+    // Don't exit - keep running
+});
+
 console.log('\n══════════════════════════════');
 console.log('RUG0xRADAR BOT STARTED');
 console.log('Multi-Chain Support Enabled');
