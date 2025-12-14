@@ -811,13 +811,42 @@ async function handleScan(chatId, tokenAddress, chainKey = null, messageId = nul
             }
         }
         
-        await bot.editMessageText(summary, {
-            chat_id: chatId,
-            message_id: loadingMsg.message_id,
-            parse_mode: 'MarkdownV2',
-            reply_markup: keyboard,
-            disable_web_page_preview: true
-        });
+        // Check for token image from DexScreener
+        const imageUrl = scanData.results.sentiment?.headerUrl || scanData.results.sentiment?.imageUrl;
+        
+        if (imageUrl) {
+            // Delete loading message and send photo with caption
+            try {
+                await bot.deleteMessage(chatId, loadingMsg.message_id);
+            } catch (e) {
+                // Ignore if can't delete
+            }
+            
+            try {
+                await bot.sendPhoto(chatId, imageUrl, {
+                    caption: summary,
+                    parse_mode: 'MarkdownV2',
+                    reply_markup: keyboard
+                });
+            } catch (photoError) {
+                // If photo fails, fall back to text
+                console.log('Photo send failed, using text:', photoError.message);
+                await bot.sendMessage(chatId, summary, {
+                    parse_mode: 'MarkdownV2',
+                    reply_markup: keyboard,
+                    disable_web_page_preview: true
+                });
+            }
+        } else {
+            // No image, use text message
+            await bot.editMessageText(summary, {
+                chat_id: chatId,
+                message_id: loadingMsg.message_id,
+                parse_mode: 'MarkdownV2',
+                reply_markup: keyboard,
+                disable_web_page_preview: true
+            });
+        }
         
         console.log(`✓ Scanned: ${tokenAddress} on ${chain} - ${scanData.riskLevel}`);
         

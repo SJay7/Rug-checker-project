@@ -906,6 +906,10 @@ async function checkSocialSentiment(tokenAddress, chainKey = DEFAULT_CHAIN) {
             socials: mainPair.info?.socials || [],
             websites: mainPair.info?.websites || [],
             
+            // Token images from DexScreener
+            imageUrl: mainPair.info?.imageUrl || null,
+            headerUrl: mainPair.info?.header || null,
+            
             // URLs
             dexScreenerUrl: `https://dexscreener.com/${mainPair.chainId}/${mainPair.pairAddress}`,
             explorerUrl: `${chain.explorer.url}/token/${tokenAddress}`,
