@@ -8,11 +8,20 @@ const { silentScan, formatSmallNumber, getChain, getSupportedChains, DEFAULT_CHA
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || 'YOUR_BOT_TOKEN_HERE';
 
-// Store scan results for callback buttons
+// Store scan results for callback buttons (max 100 entries)
 const scanCache = new Map();
 
-// Store user's preferred chain per chat
+// Store user's preferred chain per chat (max 1000 users)
 const userChains = new Map();
+const MAX_USER_CHAINS = 1000;
+
+// Cleanup old userChains entries when limit reached
+function cleanupUserChains() {
+    if (userChains.size > MAX_USER_CHAINS) {
+        const keysToDelete = Array.from(userChains.keys()).slice(0, 100);
+        keysToDelete.forEach(key => userChains.delete(key));
+    }
+}
 
 // ================================================================
 // HELPERS
@@ -74,6 +83,7 @@ function getUserChain(chatId) {
 
 function setUserChain(chatId, chainKey) {
     userChains.set(chatId, chainKey);
+    cleanupUserChains();
 }
 
 // Format large numbers: 1500 -> 1.5K, 1500000 -> 1.5M, 1500000000 -> 1.5B
@@ -851,8 +861,8 @@ async function handleScan(chatId, tokenAddress, chainKey = null, messageId = nul
         console.log(`✓ Scanned: ${tokenAddress} on ${chain} - ${scanData.riskLevel}`);
         
     } catch (error) {
-        console.error(`✗ Error: ${error.message}`);
-        await bot.editMessageText(`❌ Error: ${esc(error.message)}`, {
+        console.error(`✗ Error scanning ${tokenAddress}: ${error.message}`);
+        await bot.editMessageText(`❌ Scan failed\\. Please check the address and try again\\.`, {
             chat_id: chatId,
             message_id: loadingMsg.message_id,
             parse_mode: 'MarkdownV2'
@@ -1000,10 +1010,15 @@ bot.on('callback_query', async (query) => {
                 ]
             };
             
+            // Delete original message (works for both text and photo messages)
+            try {
+                await bot.deleteMessage(chatId, messageId);
+            } catch (e) {
+                // Ignore delete errors
+            }
+            
             // Telegram has 4096 char limit - split if needed
             if (fullReport.length > 4000) {
-                await bot.deleteMessage(chatId, messageId);
-                
                 const chunks = [];
                 let current = '';
                 const lines = fullReport.split('\n');
@@ -1027,9 +1042,7 @@ bot.on('callback_query', async (query) => {
                     });
                 }
             } else {
-                await bot.editMessageText(fullReport, {
-                    chat_id: chatId,
-                    message_id: messageId,
+                await bot.sendMessage(chatId, fullReport, {
                     parse_mode: 'MarkdownV2',
                     reply_markup: keyboard,
                     disable_web_page_preview: true
@@ -1037,7 +1050,7 @@ bot.on('callback_query', async (query) => {
             }
         } catch (error) {
             console.error('Full report error:', error.message);
-            await bot.sendMessage(chatId, `❌ Error showing full report: ${esc(error.message)}`, {
+            await bot.sendMessage(chatId, `❌ Could not generate full report\\. Please try again\\.`, {
                 parse_mode: 'MarkdownV2'
             });
         }
@@ -1081,13 +1094,37 @@ bot.on('callback_query', async (query) => {
             ]
         };
         
-        await bot.editMessageText(summary, {
-            chat_id: chatId,
-            message_id: messageId,
-            parse_mode: 'MarkdownV2',
-            reply_markup: keyboard,
-            disable_web_page_preview: true
-        });
+        // Delete original message and send new one (works for both text and photo)
+        try {
+            await bot.deleteMessage(chatId, messageId);
+        } catch (e) {
+            // Ignore delete errors
+        }
+        
+        // Check for token image
+        const imageUrl = scanData.results.sentiment?.headerUrl || scanData.results.sentiment?.imageUrl;
+        
+        if (imageUrl) {
+            try {
+                await bot.sendPhoto(chatId, imageUrl, {
+                    caption: summary,
+                    parse_mode: 'MarkdownV2',
+                    reply_markup: keyboard
+                });
+            } catch (photoError) {
+                await bot.sendMessage(chatId, summary, {
+                    parse_mode: 'MarkdownV2',
+                    reply_markup: keyboard,
+                    disable_web_page_preview: true
+                });
+            }
+        } else {
+            await bot.sendMessage(chatId, summary, {
+                parse_mode: 'MarkdownV2',
+                reply_markup: keyboard,
+                disable_web_page_preview: true
+            });
+        }
         return;
     }
     

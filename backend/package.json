@@ -12,11 +12,20 @@
     "bot": "node src/telegram-bot.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": ["crypto", "rug-checker", "security", "defi", "telegram-bot"],
+  "keywords": [
+    "crypto",
+    "rug-checker",
+    "security",
+    "defi",
+    "telegram-bot"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "ethers": "^6.16.0",
     "node-telegram-bot-api": "^0.66.0"
+  },
+  "devDependencies": {
+    "eslint": "^9.39.2"
   }
 }

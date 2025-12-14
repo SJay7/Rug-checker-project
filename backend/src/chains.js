@@ -17,7 +17,7 @@ const CHAINS = {
             name: 'Etherscan',
             url: 'https://etherscan.io',
             api: 'https://api.etherscan.io/v2/api',
-            apiKey: 'K6K49AIR8VNA9WWMWZ1M9CZTV6BNRYETZ5'
+            apiKey: process.env.ETHERSCAN_API_KEY || ''
         },
         
         // DEX
